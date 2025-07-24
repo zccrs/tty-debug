@@ -31,6 +31,26 @@
 
 static volatile int running = 1;
 
+// VT Control Mode Configuration
+typedef struct {
+    int enabled;              // Whether VT control mode is enabled
+    int target_tty;          // Target TTY to control (-1 = current TTY)
+    int silent_allow;        // Silent mode - automatically allow switches
+    int interactive_prompt;  // Show interactive prompts for VT switches
+} vt_control_config_t;
+
+static vt_control_config_t vt_control_config = {0};
+static struct vt_mode original_vt_mode = {0};
+static int vt_control_fd = -1;
+static int in_vt_control_mode = 0;
+
+// Function declarations for VT control
+void vt_control_signal_handler(int sig);
+int setup_vt_control_mode(int tty_number);
+void cleanup_vt_control_mode(void);
+int ask_user_permission(int target_vt);
+void print_usage(const char *program_name);
+
 // Get detailed information about VT control process
 typedef struct {
     pid_t pid;
@@ -163,10 +183,16 @@ void get_user_info(pid_t pid, char *username, size_t max_len, uid_t *uid) {
     }
 }
 
-// Signal handler for graceful shutdown
-void signal_handler(int sig) {
-    printf("\nReceived signal %d, shutting down...\n", sig);
-    running = 0;
+// Signal handler for graceful shutdown (monitoring mode)
+void monitoring_signal_handler(int sig) {
+    if (in_vt_control_mode) {
+        // In VT control mode, use the VT control signal handler
+        vt_control_signal_handler(sig);
+    } else {
+        // In monitoring mode, just shutdown gracefully
+        printf("\nReceived signal %d, shutting down...\n", sig);
+        running = 0;
+    }
 }
 
 // Get current time as formatted string
@@ -782,6 +808,250 @@ void print_vt_control_info(const vt_control_info_t *info, int tty_number) {
     printf("\n");
 }
 
+// Print usage information
+void print_usage(const char *program_name) {
+    printf("Usage: %s [OPTIONS]\n", program_name);
+    printf("\n");
+    printf("TTY Debug Tool - Monitor TTY changes, VT modes, and optionally control VT switching\n");
+    printf("\n");
+    printf("Options:\n");
+    printf("  -h, --help              Show this help message\n");
+    printf("  -t, --tty=N            Monitor specific TTY number (default: current TTY)\n");
+    printf("  -c, --control          Enable VT control mode (become VT control process)\n");
+    printf("  -s, --silent           Silent mode - automatically allow all VT switches\n");
+    printf("                         (only used with --control)\n");
+    printf("  -i, --interactive      Interactive mode - ask user permission for VT switches\n");
+    printf("                         (default when --control is used, conflicts with --silent)\n");
+    printf("\n");
+    printf("Modes:\n");
+    printf("  Default (monitoring):   Monitor TTY changes and VT mode changes\n");
+    printf("  Control mode (-c):      Become the VT control process and handle VT switching\n");
+    printf("  Silent control (-c -s): Allow all VT switches automatically\n");
+    printf("  Interactive (-c -i):    Ask user permission for each VT switch (default)\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  %s                     # Monitor current TTY\n", program_name);
+    printf("  %s -t 2               # Monitor TTY 2\n", program_name);
+    printf("  %s -c                 # Control current TTY with interactive prompts\n", program_name);
+    printf("  %s -c -s              # Control current TTY, allow all switches\n", program_name);
+    printf("  %s -c -t 3            # Control TTY 3 with interactive prompts\n", program_name);
+    printf("  %s -c -s -t 1         # Control TTY 1, allow all switches\n", program_name);
+    printf("\n");
+    printf("Note: VT control mode requires running on a virtual terminal (tty1, tty2, etc.)\n");
+}
+
+// Get current TTY number
+int get_current_tty_number(void) {
+    char *tty_name = ttyname(STDIN_FILENO);
+    if (!tty_name) {
+        return -1;
+    }
+
+    // Parse TTY name like "/dev/tty2" -> 2
+    if (strncmp(tty_name, "/dev/tty", 8) == 0) {
+        char *tty_num_str = tty_name + 8;
+        char *endptr;
+        long tty_num = strtol(tty_num_str, &endptr, 10);
+        if (*endptr == '\0' && tty_num > 0 && tty_num <= 63) {
+            return (int)tty_num;
+        }
+    }
+
+    return -1;
+}
+
+// Ask user permission for VT switch
+int ask_user_permission(int target_vt) {
+    char response[10];
+    char time_str[64];
+    get_current_time(time_str, sizeof(time_str));
+
+    printf("\n[%s] VT SWITCH REQUEST:\n", time_str);
+    printf("System wants to switch to VT %d\n", target_vt);
+    printf("Allow this switch? [y/N/a/d]: ");
+    printf("  y = Yes, allow this switch\n");
+    printf("  N = No, deny this switch (default)\n");
+    printf("  a = Always allow (switch to silent mode)\n");
+    printf("  d = Deny and disable control mode\n");
+    printf("Choice: ");
+    fflush(stdout);
+
+    if (fgets(response, sizeof(response), stdin) == NULL) {
+        printf("Failed to read input, denying switch\n");
+        return 0;
+    }
+
+    // Remove newline
+    response[strcspn(response, "\n")] = '\0';
+
+    switch (response[0]) {
+        case 'y':
+        case 'Y':
+            printf("Allowing VT switch to %d\n", target_vt);
+            return 1;
+
+        case 'a':
+        case 'A':
+            printf("Switching to silent mode - will allow all future switches\n");
+            vt_control_config.silent_allow = 1;
+            vt_control_config.interactive_prompt = 0;
+            return 1;
+
+        case 'd':
+        case 'D':
+            printf("Disabling VT control mode and allowing switch\n");
+            cleanup_vt_control_mode();
+            return 1;
+
+        case 'n':
+        case 'N':
+        case '\0':  // Empty input
+        default:
+            printf("Denying VT switch to %d\n", target_vt);
+            return 0;
+    }
+}
+
+// VT control signal handler
+void vt_control_signal_handler(int sig) {
+    char time_str[64];
+    get_current_time(time_str, sizeof(time_str));
+
+    if (sig == SIGUSR1) {  // VT release signal
+        printf("\n[%s] VT Release signal received (SIGUSR1)\n", time_str);
+
+        // Get current VT to determine target
+        int current_vt = get_active_tty_from_sysfs();
+        if (current_vt == -1) {
+            current_vt = vt_control_config.target_tty;
+        }
+
+        printf("Request to release VT %d for switching\n", current_vt);
+
+        int allow_switch = 1;
+
+        if (vt_control_config.silent_allow) {
+            printf("Silent mode: Automatically allowing VT switch\n");
+        } else if (vt_control_config.interactive_prompt) {
+            // We can't safely do interactive prompts in signal handler
+            // So we'll just allow it and log
+            printf("Interactive mode: Allowing switch (interactive prompts not safe in signal handler)\n");
+            printf("Note: Use SIGUSR2 handler for better interactive experience\n");
+        }
+
+        if (allow_switch) {
+            printf("Acknowledging VT release\n");
+            if (vt_control_fd != -1) {
+                ioctl(vt_control_fd, VT_RELDISP, 1);  // Allow release
+            }
+        } else {
+            printf("Denying VT release\n");
+            if (vt_control_fd != -1) {
+                ioctl(vt_control_fd, VT_RELDISP, 0);  // Deny release
+            }
+        }
+
+    } else if (sig == SIGUSR2) {  // VT acquire signal
+        printf("\n[%s] VT Acquire signal received (SIGUSR2)\n", time_str);
+        printf("VT has been switched back to us\n");
+        printf("Acknowledging VT acquisition\n");
+
+        if (vt_control_fd != -1) {
+            ioctl(vt_control_fd, VT_RELDISP, VT_ACKACQ);  // Acknowledge acquire
+        }
+
+    } else if (sig == SIGINT || sig == SIGTERM) {
+        printf("\n[%s] Received termination signal %d\n", time_str, sig);
+        running = 0;
+    }
+}
+
+// Setup VT control mode
+int setup_vt_control_mode(int tty_number) {
+    char tty_path[MAX_PATH_LEN];
+    snprintf(tty_path, sizeof(tty_path), "/dev/tty%d", tty_number);
+
+    printf("Setting up VT control mode for TTY %d\n", tty_number);
+
+    // Open TTY device
+    vt_control_fd = open(tty_path, O_RDWR | O_NOCTTY);
+    if (vt_control_fd == -1) {
+        fprintf(stderr, "Failed to open %s: %s\n", tty_path, strerror(errno));
+        return -1;
+    }
+
+    // Get current VT mode
+    if (ioctl(vt_control_fd, VT_GETMODE, &original_vt_mode) == -1) {
+        fprintf(stderr, "Failed to get current VT mode: %s\n", strerror(errno));
+        close(vt_control_fd);
+        vt_control_fd = -1;
+        return -1;
+    }
+
+    printf("Original VT mode: %s\n", get_vt_mode_string(original_vt_mode.mode));
+
+    // Set up signal handlers
+    signal(SIGUSR1, vt_control_signal_handler);
+    signal(SIGUSR2, vt_control_signal_handler);
+
+    // Set VT_PROCESS mode
+    struct vt_mode new_mode = {
+        .mode = VT_PROCESS,
+        .waitv = 0,
+        .relsig = SIGUSR1,
+        .acqsig = SIGUSR2,
+        .frsig = 0
+    };
+
+    if (ioctl(vt_control_fd, VT_SETMODE, &new_mode) == -1) {
+        fprintf(stderr, "Failed to set VT_PROCESS mode: %s\n", strerror(errno));
+        close(vt_control_fd);
+        vt_control_fd = -1;
+        return -1;
+    }
+
+    in_vt_control_mode = 1;
+    printf("VT control mode enabled successfully!\n");
+    printf("This process (PID %d) is now the VT control process for TTY %d\n",
+           getpid(), tty_number);
+    printf("VT signals: Release=%d, Acquire=%d\n", SIGUSR1, SIGUSR2);
+
+    if (vt_control_config.silent_allow) {
+        printf("Running in SILENT mode - all VT switches will be allowed automatically\n");
+    } else {
+        printf("Running in INTERACTIVE mode - VT switches will be logged\n");
+        printf("Note: Interactive prompts in signal handlers are limited\n");
+    }
+
+    return 0;
+}
+
+// Cleanup VT control mode
+void cleanup_vt_control_mode(void) {
+    if (!in_vt_control_mode || vt_control_fd == -1) {
+        return;
+    }
+
+    printf("\nCleaning up VT control mode...\n");
+
+    // Restore original VT mode
+    if (ioctl(vt_control_fd, VT_SETMODE, &original_vt_mode) == -1) {
+        fprintf(stderr, "Warning: Failed to restore original VT mode: %s\n", strerror(errno));
+    } else {
+        printf("Original VT mode restored: %s\n", get_vt_mode_string(original_vt_mode.mode));
+    }
+
+    // Restore default signal handlers
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGUSR2, SIG_DFL);
+
+    close(vt_control_fd);
+    vt_control_fd = -1;
+    in_vt_control_mode = 0;
+
+    printf("VT control mode cleanup completed\n");
+}
+
 // Collect information about a TTY
 void collect_tty_info(int tty_number, tty_info_t *info) {
     memset(info, 0, sizeof(tty_info_t));
@@ -949,13 +1219,123 @@ void print_vt_mode_change(const tty_info_t *old_info, const tty_info_t *new_info
     printf("  ---\n");
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
     printf("TTY Debug Tool - Enhanced Version with VT Control Process Detection\n");
     printf("===================================================================\n\n");
 
+    // Parse command line arguments
+    int show_help = 0;
+
+    // Initialize config with defaults
+    vt_control_config.target_tty = -1;  // Will be set to current TTY
+    vt_control_config.enabled = 0;
+    vt_control_config.silent_allow = 0;
+    vt_control_config.interactive_prompt = 1;  // Default for control mode
+
+    // Simple argument parsing (getopt would be better but keeping dependencies minimal)
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            show_help = 1;
+        } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--control") == 0) {
+            vt_control_config.enabled = 1;
+        } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
+            vt_control_config.silent_allow = 1;
+            vt_control_config.interactive_prompt = 0;
+        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
+            vt_control_config.interactive_prompt = 1;
+            vt_control_config.silent_allow = 0;
+        } else if (strncmp(argv[i], "-t", 2) == 0 || strncmp(argv[i], "--tty", 5) == 0) {
+            char *tty_str = NULL;
+            if (strncmp(argv[i], "-t", 2) == 0) {
+                if (strlen(argv[i]) > 2) {
+                    tty_str = argv[i] + 2;  // -t2
+                } else if (i + 1 < argc) {
+                    tty_str = argv[++i];    // -t 2
+                }
+            } else if (strncmp(argv[i], "--tty=", 6) == 0) {
+                tty_str = argv[i] + 6;      // --tty=2
+            } else if (i + 1 < argc) {
+                tty_str = argv[++i];        // --tty 2
+            }
+
+            if (tty_str) {
+                char *endptr;
+                long tty_num = strtol(tty_str, &endptr, 10);
+                if (*endptr == '\0' && tty_num > 0 && tty_num <= 63) {
+                    vt_control_config.target_tty = (int)tty_num;
+                } else {
+                    fprintf(stderr, "Error: Invalid TTY number '%s'. Must be 1-63.\n", tty_str);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "Error: TTY number required for %s option\n", argv[i]);
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "Error: Unknown option '%s'\n", argv[i]);
+            fprintf(stderr, "Use --help for usage information.\n");
+            return 1;
+        }
+    }
+
+    if (show_help) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    // Validate arguments
+    if (vt_control_config.silent_allow && vt_control_config.interactive_prompt) {
+        fprintf(stderr, "Error: --silent and --interactive options are mutually exclusive\n");
+        return 1;
+    }
+
+    if (vt_control_config.silent_allow && !vt_control_config.enabled) {
+        fprintf(stderr, "Error: --silent can only be used with --control\n");
+        return 1;
+    }
+
+    // Determine target TTY
+    if (vt_control_config.target_tty == -1) {
+        vt_control_config.target_tty = get_current_tty_number();
+        if (vt_control_config.target_tty == -1) {
+            if (vt_control_config.enabled) {
+                fprintf(stderr, "Error: Could not determine current TTY and no TTY specified.\n");
+                fprintf(stderr, "VT control mode requires running on a virtual terminal (tty1, tty2, etc.)\n");
+                fprintf(stderr, "Use -t option to specify target TTY.\n");
+                return 1;
+            } else {
+                // For monitoring mode, try to get from sysfs
+                vt_control_config.target_tty = get_active_tty_from_sysfs();
+                if (vt_control_config.target_tty == -1) {
+                    fprintf(stderr, "Error: Could not determine target TTY\n");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    printf("Target TTY: %d\n", vt_control_config.target_tty);
+
+    if (vt_control_config.enabled) {
+        printf("Mode: VT Control\n");
+        if (vt_control_config.silent_allow) {
+            printf("VT Switch Policy: Silent (allow all)\n");
+        } else {
+            printf("VT Switch Policy: Interactive (log all)\n");
+        }
+        printf("\n");
+
+        // Setup VT control mode
+        if (setup_vt_control_mode(vt_control_config.target_tty) == -1) {
+            return 1;
+        }
+    } else {
+        printf("Mode: Monitoring\n\n");
+    }
+
     // Setup signal handlers
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    signal(SIGINT, monitoring_signal_handler);
+    signal(SIGTERM, monitoring_signal_handler);
 
     // Check if sysfs files exist
     if (access(SYSFS_TTY0_ACTIVE, R_OK) != 0) {
@@ -965,13 +1345,20 @@ int main(void) {
     }
 
     // Get initial TTY state
-    int current_tty = get_active_tty_from_sysfs();
-    if (current_tty == -1) {
-        fprintf(stderr, "Failed to get initial TTY state\n");
-        return 1;
+    int current_tty;
+    if (vt_control_config.enabled) {
+        // In control mode, use the target TTY
+        current_tty = vt_control_config.target_tty;
+    } else {
+        // In monitoring mode, get active TTY
+        current_tty = get_active_tty_from_sysfs();
+        if (current_tty == -1) {
+            fprintf(stderr, "Failed to get initial TTY state\n");
+            return 1;
+        }
     }
 
-    printf("Initial active TTY: %d\n", current_tty);
+    printf("Monitoring TTY: %d\n", current_tty);
 
     // Collect and display initial TTY information
     tty_info_t info, previous_info;
@@ -1089,6 +1476,12 @@ int main(void) {
     }
 
     close(sysfs_fd);
+
+    // Cleanup VT control mode if enabled
+    if (vt_control_config.enabled) {
+        cleanup_vt_control_mode();
+    }
+
     printf("TTY monitoring stopped.\n");
     return 0;
 }

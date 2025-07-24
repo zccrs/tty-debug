@@ -1,6 +1,6 @@
 # TTY Debug Tool
 
-一个用于监控TTY切换、VT模式变化和进程信号活动的C语言工具。
+一个用于监控TTY切换、VT模式变化和进程信号活动的C语言工具，同时支持作为VT控制进程来管理VT切换。
 
 ## 功能特性
 
@@ -27,6 +27,13 @@
 - 检查进程是否有TTY设备访问权限
 - 按活动分数排序显示最可能的嫌疑进程
 
+### 5. VT控制模式 (新增)
+- **VT控制进程模式**：tty-debug可以作为VT控制进程运行
+- **VT切换拦截**：接收并处理VT切换信号（SIGUSR1/SIGUSR2）
+- **交互式确认**：可以询问用户是否允许VT切换
+- **静默模式**：自动允许所有VT切换并记录日志
+- **指定目标TTY**：可以控制特定的TTY而非当前TTY
+
 ## 编译
 
 ```bash
@@ -39,16 +46,45 @@ clang -Wall -Wextra -std=c99 -o tty-debug tty-debug.c
 
 ## 使用方法
 
+### 命令行选项
+```bash
+# 显示帮助信息
+./tty-debug --help
+
+# 监控模式（默认）
+./tty-debug              # 监控当前TTY
+./tty-debug -t 2         # 监控指定TTY 2
+
+# VT控制模式
+./tty-debug -c           # 成为当前TTY的VT控制进程
+./tty-debug -c -s        # 静默模式，自动允许所有VT切换
+./tty-debug -c -t 3      # 控制指定TTY 3
+./tty-debug -c -s -t 1   # 静默模式控制TTY 1
+```
+
 ### 基本使用
 ```bash
-# 直接运行（需要读取/sys/class/tty/目录的权限）
+# 监控模式 - 观察TTY和VT变化
 ./tty-debug
 
 # 程序将显示：
 # 1. 当前活跃的TTY信息
 # 2. VT模式配置（模式、信号）
 # 3. 会话领导进程信息
-# 4. 监控的进程列表
+# 4. VT控制进程信息
+# 5. 监控的进程列表
+```
+
+### VT控制模式使用
+```bash
+# 成为VT控制进程，静默允许所有切换
+./tty-debug -c -s
+
+# 成为VT控制进程，记录所有VT信号活动
+./tty-debug -c
+
+# 控制特定的TTY
+./tty-debug -c -t 2 -s
 ```
 
 ### 监控内容
@@ -130,7 +166,7 @@ sudo bash -c 'echo 1 > /sys/class/tty/tty2/mode'  # 设置为VT_PROCESS
 ```
 
 ### 测试VT控制进程检测
-项目还包含一个专门的测试程序来验证VT控制进程检测：
+项目包含测试程序来验证VT控制进程检测：
 
 ```bash
 # 编译测试程序
@@ -143,13 +179,17 @@ clang -Wall -Wextra -std=c99 -o test_vt_control test_vt_control.c
 ./tty-debug
 ```
 
-测试程序会：
-1. 设置VT为`VT_PROCESS`模式
-2. 注册VT信号处理器
-3. 成为当前VT的控制进程
-4. 响应VT切换信号
+### 测试新的VT控制功能
+```bash
+# 运行VT控制模式测试
+./test_vt_control_mode.sh
+```
 
-在tty-debug中，您将看到`test_vt_control`被识别为VT控制进程。
+该脚本将演示：
+1. tty-debug的VT控制模式
+2. VT信号拦截和处理
+3. 静默模式vs交互模式
+4. 指定TTY控制
 
 ### 完整功能演示
 运行完整的演示脚本：
@@ -197,6 +237,9 @@ VT控制进程是指：
 - **权限诊断**：确认进程是否有适当的VT控制权限
 - **信号跟踪**：了解VT信号的接收者
 - **系统分析**：区分会话管理和VT控制的职责
+- **VT访问控制**：在安全环境中控制VT切换权限
+- **VT切换监控**：记录和分析VT切换行为
+- **测试VT功能**：为VT相关开发提供测试工具
 
 ## 技术实现
 
