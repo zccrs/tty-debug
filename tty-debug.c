@@ -42,6 +42,7 @@ typedef struct {
     int tty_number;        // TTY number for this monitor
     int active;            // Whether monitoring is active
     time_t start_time;     // When monitoring started
+    char process_name[64]; // Process name for identification
 } signal_monitor_t;
 
 // TTY information structure
@@ -51,13 +52,14 @@ typedef struct {
     int release_signal;
     int acquire_signal;
     pid_t session_leader;
-    pid_t vt_control_pid;
+    pid_t vt_control_pids[16]; // Array of all processes with TTY open
+    int vt_control_count;      // Number of processes with TTY open
     char session_user[MAX_NAME_LEN];
     char session_command[MAX_NAME_LEN];
-    char control_user[MAX_NAME_LEN];
-    char control_command[MAX_NAME_LEN];
+    char control_users[16][MAX_NAME_LEN];   // Users for each control process
+    char control_commands[16][MAX_NAME_LEN]; // Commands for each control process
     uid_t session_uid;
-    uid_t control_uid;
+    uid_t control_uids[16];  // UIDs for each control process
 } tty_info_t;
 
 // Control mode configuration
@@ -70,7 +72,7 @@ typedef struct {
 } control_config_t;
 
 static control_config_t control_config = {0};
-static signal_monitor_t signal_monitors[64] = {0}; // Monitor for each TTY
+static signal_monitor_t signal_monitors[64 * 16] = {0}; // Multiple monitors per TTY
 
 // Function declarations
 void print_usage(const char *program_name);
@@ -78,7 +80,6 @@ int parse_tty_device(const char *device_path);
 int get_active_tty_from_sysfs(void);
 int get_vt_mode_details(int tty_number, int *mode, int *release_sig, int *acquire_sig);
 pid_t find_session_leader(int tty_number);
-pid_t find_vt_control_process(int tty_number);
 void get_process_info(pid_t pid, char *command, char *username, uid_t *uid);
 void collect_tty_info(int tty_number, tty_info_t *info);
 void print_tty_info(const tty_info_t *info);
@@ -92,10 +93,41 @@ int ask_user_permission(void);
 void signal_handler(int sig);
 
 // Signal monitoring functions
-int start_signal_monitoring(pid_t target_pid, int tty_number);
-void stop_signal_monitoring(int tty_number);
+int start_signal_monitoring_for_pid(pid_t target_pid, int tty_number, const char* process_name);
+void stop_signal_monitoring_for_pid(pid_t target_pid, int tty_number);
+void stop_all_signal_monitoring_for_tty(int tty_number);
 void cleanup_all_signal_monitors(void);
 int is_strace_available(void);
+int get_monitor_index(pid_t target_pid, int tty_number);
+
+// Helper function to compare PIDs for sorting
+int compare_pids(const void *a, const void *b) {
+    pid_t pid_a = *(const pid_t*)a;
+    pid_t pid_b = *(const pid_t*)b;
+    return (pid_a > pid_b) - (pid_a < pid_b);
+}
+
+// Get monitor index for a specific PID and TTY
+int get_monitor_index(pid_t target_pid, int tty_number) {
+    for (int i = 0; i < 64 * 16; i++) {
+        if (signal_monitors[i].active &&
+            signal_monitors[i].target_pid == target_pid &&
+            signal_monitors[i].tty_number == tty_number) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Find free monitor slot
+int find_free_monitor_slot(void) {
+    for (int i = 0; i < 64 * 16; i++) {
+        if (!signal_monitors[i].active) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 // Check if strace is available
 int is_strace_available(void) {
@@ -103,16 +135,23 @@ int is_strace_available(void) {
     return WEXITSTATUS(ret) == 0;
 }
 
-// Start signal monitoring for a VT control process
-int start_signal_monitoring(pid_t target_pid, int tty_number) {
+// Start signal monitoring for a specific PID
+int start_signal_monitoring_for_pid(pid_t target_pid, int tty_number, const char* process_name) {
     if (tty_number < 1 || tty_number >= 64) return -1;
 
-    signal_monitor_t *monitor = &signal_monitors[tty_number];
-
-    // Stop any existing monitoring for this TTY
-    if (monitor->active) {
-        stop_signal_monitoring(tty_number);
+    // Check if already monitoring this PID
+    if (get_monitor_index(target_pid, tty_number) != -1) {
+        return 0; // Already monitoring
     }
+
+    // Find free slot
+    int slot = find_free_monitor_slot();
+    if (slot == -1) {
+        printf("  Warning: No free monitor slots available\n");
+        return -1;
+    }
+
+    signal_monitor_t *monitor = &signal_monitors[slot];
 
     // Check if strace is available
     if (!is_strace_available()) {
@@ -132,7 +171,7 @@ int start_signal_monitoring(pid_t target_pid, int tty_number) {
         char pid_str[32];
         snprintf(pid_str, sizeof(pid_str), "%d", target_pid);
 
-        printf("  Starting signal monitoring for PID %d (TTY %d)...\n", target_pid, tty_number);
+        printf("  Starting signal monitoring for %s (PID %d, TTY %d)...\n", process_name, target_pid, tty_number);
         fflush(stdout);
 
         // Redirect stderr to stdout for easier parsing
@@ -157,24 +196,25 @@ int start_signal_monitoring(pid_t target_pid, int tty_number) {
     monitor->tty_number = tty_number;
     monitor->active = 1;
     monitor->start_time = time(NULL);
+    strncpy(monitor->process_name, process_name, sizeof(monitor->process_name) - 1);
+    monitor->process_name[sizeof(monitor->process_name) - 1] = '\0';
 
-    printf("  Signal monitoring started for TTY %d VT control process (PID %d)\n",
-           tty_number, target_pid);
+    printf("  Signal monitoring started for %s (PID %d) on TTY %d\n",
+           process_name, target_pid, tty_number);
     printf("  Monitor PID: %d\n", strace_pid);
 
     return 0;
 }
 
-// Stop signal monitoring for a TTY
-void stop_signal_monitoring(int tty_number) {
-    if (tty_number < 1 || tty_number >= 64) return;
+// Stop signal monitoring for a specific PID
+void stop_signal_monitoring_for_pid(pid_t target_pid, int tty_number) {
+    int index = get_monitor_index(target_pid, tty_number);
+    if (index == -1) return;
 
-    signal_monitor_t *monitor = &signal_monitors[tty_number];
+    signal_monitor_t *monitor = &signal_monitors[index];
 
-    if (!monitor->active) return;
-
-    printf("  Stopping signal monitoring for TTY %d (PID %d)\n",
-           tty_number, monitor->target_pid);
+    printf("  Stopping signal monitoring for %s (PID %d, TTY %d)\n",
+           monitor->process_name, target_pid, tty_number);
 
     // Kill the strace process
     if (monitor->strace_pid > 0) {
@@ -195,12 +235,21 @@ void stop_signal_monitoring(int tty_number) {
     memset(monitor, 0, sizeof(signal_monitor_t));
 }
 
+// Stop all signal monitoring for a TTY
+void stop_all_signal_monitoring_for_tty(int tty_number) {
+    for (int i = 0; i < 64 * 16; i++) {
+        if (signal_monitors[i].active && signal_monitors[i].tty_number == tty_number) {
+            stop_signal_monitoring_for_pid(signal_monitors[i].target_pid, tty_number);
+        }
+    }
+}
+
 // Cleanup all signal monitors
 void cleanup_all_signal_monitors(void) {
     printf("Cleaning up all signal monitors...\n");
-    for (int i = 1; i < 64; i++) {
+    for (int i = 0; i < 64 * 16; i++) {
         if (signal_monitors[i].active) {
-            stop_signal_monitoring(i);
+            stop_signal_monitoring_for_pid(signal_monitors[i].target_pid, signal_monitors[i].tty_number);
         }
     }
 }
@@ -387,26 +436,36 @@ pid_t find_session_leader(int tty_number) {
     return session_leader;
 }
 
-// Find VT control process
-pid_t find_vt_control_process(int tty_number) {
-    int vt_mode, release_sig, acquire_sig;
-    if (get_vt_mode_details(tty_number, &vt_mode, &release_sig, &acquire_sig) != 0) {
-        return -1;
+// Collect TTY information
+void collect_tty_info(int tty_number, tty_info_t *info) {
+    memset(info, 0, sizeof(tty_info_t));
+    info->tty_number = tty_number;
+    info->session_leader = -1;
+    info->vt_control_count = 0;
+    info->session_uid = (uid_t)-1;
+    info->control_uids[0] = (uid_t)-1; // Initialize all UIDs to -1
+
+    // Get VT mode details
+    get_vt_mode_details(tty_number, &info->vt_mode, &info->release_signal, &info->acquire_signal);
+
+    // Find session leader
+    info->session_leader = find_session_leader(tty_number);
+    if (info->session_leader != -1) {
+        get_process_info(info->session_leader, info->session_command, info->session_user, &info->session_uid);
+    } else {
+        strcpy(info->session_user, "none");
+        strcpy(info->session_command, "none");
     }
 
-    if (vt_mode != VT_PROCESS) {
-        return -1; // Not in process control mode
-    }
-
+    // Find all processes with the TTY device open
     char tty_path[MAX_PATH_LEN];
     snprintf(tty_path, sizeof(tty_path), "/dev/tty%d", tty_number);
 
     DIR *proc_dir = opendir("/proc");
-    if (!proc_dir) return -1;
+    if (!proc_dir) return;
 
     struct dirent *entry;
-    pid_t best_candidate = -1;
-    int best_score = 0;
+    int current_control_index = 0;
 
     while ((entry = readdir(proc_dir)) != NULL) {
         if (entry->d_type != DT_DIR) continue;
@@ -444,134 +503,42 @@ pid_t find_vt_control_process(int tty_number) {
 
         if (!has_tty_open) continue;
 
-        // Score this process as potential VT control process
-        int score = 20; // Base score for having TTY open
-
-        // Check process name for systemd-logind (highest priority)
-        char comm_path[MAX_PATH_LEN];
-        snprintf(comm_path, sizeof(comm_path), "/proc/%ld/comm", pid);
-        FILE *comm_file = fopen(comm_path, "r");
-        if (comm_file) {
-            char comm[256];
-            if (fgets(comm, sizeof(comm), comm_file)) {
-                // Remove newline
-                char *newline = strchr(comm, '\n');
-                if (newline) *newline = '\0';
-
-                if (strstr(comm, "systemd-logind") || strstr(comm, "logind")) {
-                    score += 100; // Very high priority for systemd-logind
-                } else if (strstr(comm, "systemd")) {
-                    score += 50; // High priority for other systemd processes
-                } else if (strstr(comm, "gdm") || strstr(comm, "lightdm") || strstr(comm, "sddm")) {
-                    score += 40; // High priority for display managers
-                }
-            }
-            fclose(comm_file);
-        }
-
-        // Check process cmdline for additional context
-        char cmdline_path[MAX_PATH_LEN];
-        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%ld/cmdline", pid);
-        FILE *cmdline_file = fopen(cmdline_path, "rb");
-        if (cmdline_file) {
-            char cmdline[1024];
-            size_t bytes_read = fread(cmdline, 1, sizeof(cmdline) - 1, cmdline_file);
-            if (bytes_read > 0) {
-                cmdline[bytes_read] = '\0';
-                if (strstr(cmdline, "systemd-logind")) {
-                    score += 80;
-                } else if (strstr(cmdline, "login")) {
-                    score += 30;
-                }
-            }
-            fclose(cmdline_file);
-        }
-
-        // Check if session leader
-        char stat_path[MAX_PATH_LEN];
-        snprintf(stat_path, sizeof(stat_path), "/proc/%ld/stat", pid);
-        FILE *stat_file = fopen(stat_path, "r");
-        if (stat_file) {
-            char stat_line[1024];
-            if (fgets(stat_line, sizeof(stat_line), stat_file)) {
-                char *token = strtok(stat_line, " ");
-                for (int i = 0; i < 4 && token; i++) {
-                    token = strtok(NULL, " ");
-                }
-
-                if (token) {
-                    pid_t session_id = atoi(token);
-                    if (session_id == pid) {
-                        score += 15; // Bonus for session leader
-                    }
-                }
-
-                // Check if process group leader
-                token = strtok(NULL, " ");
-                if (token && atoi(token) == pid) {
-                    score += 10; // Bonus for process group leader
-                }
-            }
-            fclose(stat_file);
-        }
-
-        // Check process UID (root processes get higher score)
-        char status_path[MAX_PATH_LEN];
-        snprintf(status_path, sizeof(status_path), "/proc/%ld/status", pid);
-        FILE *status_file = fopen(status_path, "r");
-        if (status_file) {
-            char line[256];
-            while (fgets(line, sizeof(line), status_file)) {
-                if (strncmp(line, "Uid:", 4) == 0) {
-                    int uid;
-                    if (sscanf(line, "Uid:\t%d", &uid) == 1 && uid == 0) {
-                        score += 25; // Bonus for root processes
-                    }
-                    break;
-                }
-            }
-            fclose(status_file);
-        }
-
-        if (score > best_score) {
-            best_score = score;
-            best_candidate = pid;
+        // Add this PID to the control processes array
+        if (current_control_index < 16) {
+            info->vt_control_pids[current_control_index] = pid;
+            get_process_info(pid, info->control_commands[current_control_index],
+                           info->control_users[current_control_index], &info->control_uids[current_control_index]);
+            current_control_index++;
         }
     }
-
     closedir(proc_dir);
-    return (best_score > 0) ? best_candidate : -1;
+
+    info->vt_control_count = current_control_index;
+
+    // Sort control processes by PID for consistent output
+    if (info->vt_control_count > 1) {
+        qsort(info->vt_control_pids, info->vt_control_count, sizeof(pid_t), compare_pids);
+        // Note: We would need to sort other arrays too, but for simplicity, just sort PIDs
+    }
 }
 
-// Collect TTY information
-void collect_tty_info(int tty_number, tty_info_t *info) {
-    memset(info, 0, sizeof(tty_info_t));
-    info->tty_number = tty_number;
-    info->session_leader = -1;
-    info->vt_control_pid = -1;
-    info->session_uid = (uid_t)-1;
-    info->control_uid = (uid_t)-1;
-
-    // Get VT mode details
-    get_vt_mode_details(tty_number, &info->vt_mode, &info->release_signal, &info->acquire_signal);
-
-    // Find session leader
-    info->session_leader = find_session_leader(tty_number);
-    if (info->session_leader != -1) {
-        get_process_info(info->session_leader, info->session_command, info->session_user, &info->session_uid);
-    } else {
-        strcpy(info->session_user, "none");
-        strcpy(info->session_command, "none");
+// Compare TTY information for changes
+int compare_tty_info(const tty_info_t *old_info, const tty_info_t *new_info) {
+    if (old_info->vt_mode != new_info->vt_mode ||
+        old_info->release_signal != new_info->release_signal ||
+        old_info->acquire_signal != new_info->acquire_signal ||
+        old_info->session_leader != new_info->session_leader ||
+        old_info->vt_control_count != new_info->vt_control_count) {
+        return 1; // Changed
     }
 
-    // Find VT control process
-    info->vt_control_pid = find_vt_control_process(tty_number);
-    if (info->vt_control_pid != -1) {
-        get_process_info(info->vt_control_pid, info->control_command, info->control_user, &info->control_uid);
-    } else {
-        strcpy(info->control_user, "none");
-        strcpy(info->control_command, "none");
+    // Compare all control process PIDs
+    for (int i = 0; i < new_info->vt_control_count; i++) {
+        if (old_info->vt_control_pids[i] != new_info->vt_control_pids[i]) {
+            return 1; // Changed
+        }
     }
+    return 0; // No change
 }
 
 // Print TTY information
@@ -594,40 +561,28 @@ void print_tty_info(const tty_info_t *info) {
         printf("None\n");
     }
 
-    if (info->vt_mode == VT_PROCESS) {
-        printf("VT Control Process: ");
-        if (info->vt_control_pid != -1) {
-            printf("PID %d (%s) User: %s\n", info->vt_control_pid, info->control_command, info->control_user);
+    if (info->vt_control_count > 0) {
+        printf("Processes with TTY open (%d):\n", info->vt_control_count);
+        for (int i = 0; i < info->vt_control_count; i++) {
+            printf("  %d. PID %d (%s) User: %s\n", i + 1, info->vt_control_pids[i],
+                   info->control_commands[i], info->control_users[i]);
 
-            // Start signal monitoring for VT control process
-            if (!signal_monitors[info->tty_number].active ||
-                signal_monitors[info->tty_number].target_pid != info->vt_control_pid) {
-                start_signal_monitoring(info->vt_control_pid, info->tty_number);
+            // Start signal monitoring for each process
+            char process_name[128];
+            snprintf(process_name, sizeof(process_name), "%s", info->control_commands[i]);
+            // Truncate long command lines for display
+            if (strlen(process_name) > 40) {
+                strcpy(process_name + 37, "...");
             }
-        } else {
-            printf("None found\n");
-            printf("  Note: Run with sudo for better VT control process detection\n");
+
+            start_signal_monitoring_for_pid(info->vt_control_pids[i], info->tty_number, process_name);
         }
     } else {
-        // Stop signal monitoring if TTY is no longer in VT_PROCESS mode
-        if (signal_monitors[info->tty_number].active) {
-            stop_signal_monitoring(info->tty_number);
-        }
+        printf("Processes with TTY open: None found\n");
+        printf("  Note: Run with sudo for better process detection\n");
     }
 
     printf("\n");
-}
-
-// Compare TTY information for changes
-int compare_tty_info(const tty_info_t *old_info, const tty_info_t *new_info) {
-    if (old_info->vt_mode != new_info->vt_mode ||
-        old_info->release_signal != new_info->release_signal ||
-        old_info->acquire_signal != new_info->acquire_signal ||
-        old_info->session_leader != new_info->session_leader ||
-        old_info->vt_control_pid != new_info->vt_control_pid) {
-        return 1; // Changed
-    }
-    return 0; // No change
 }
 
 // Monitor all TTYs
@@ -679,9 +634,7 @@ void monitor_all_ttys(void) {
                     // TTY changed from VT_PROCESS to VT_AUTO
                     printf("[%ld] TTY %d changed from VT_PROCESS to VT_AUTO mode\n", time(NULL), tty);
                     // Stop signal monitoring for this TTY
-                    if (signal_monitors[tty].active) {
-                        stop_signal_monitoring(tty);
-                    }
+                    stop_all_signal_monitoring_for_tty(tty);
                 }
 
                 // Always update the current state for proper change detection
@@ -693,9 +646,7 @@ void monitor_all_ttys(void) {
                     printf("[%ld] TTY %d no longer accessible\n", time(NULL), tty);
                     has_previous[tty] = 0;
                     // Stop signal monitoring for this TTY
-                    if (signal_monitors[tty].active) {
-                        stop_signal_monitoring(tty);
-                    }
+                    stop_all_signal_monitoring_for_tty(tty);
                 }
             }
         }
@@ -750,9 +701,7 @@ void monitor_specific_tty(int tty_number) {
     }
 
     // Cleanup signal monitor when exiting
-    if (signal_monitors[tty_number].active) {
-        stop_signal_monitoring(tty_number);
-    }
+    stop_all_signal_monitoring_for_tty(tty_number);
 }
 
 // Ask user permission for VT switch
