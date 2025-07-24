@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/poll.h>
+#include <sys/signalfd.h>
 #include <errno.h>
 #include <pwd.h>
 #include <signal.h>
@@ -55,6 +56,7 @@ typedef struct {
     int tty_number;
     int auto_allow;        // -y flag: automatically allow switches
     int control_fd;
+    int signal_fd;         // signalfd for safe signal handling
     struct vt_mode original_mode;
 } control_config_t;
 
@@ -75,7 +77,8 @@ void monitor_all_ttys(void);
 void monitor_specific_tty(int tty_number);
 int setup_control_mode(int tty_number, int auto_allow);
 void cleanup_control_mode(void);
-void control_signal_handler(int sig);
+void handle_vt_signals(void);
+int ask_user_permission(void);
 void signal_handler(int sig);
 
 // Get process information
@@ -484,50 +487,93 @@ void monitor_specific_tty(int tty_number) {
     }
 }
 
-// Control mode signal handler
-void control_signal_handler(int sig) {
+// Ask user permission for VT switch
+int ask_user_permission(void) {
+    printf("Allow TTY switch? [y/N]: ");
+    fflush(stdout);
+
+    char response[10];
+    if (fgets(response, sizeof(response), stdin) != NULL) {
+        return (response[0] == 'y' || response[0] == 'Y');
+    }
+    return 0; // Default to deny
+}
+
+// Handle VT signals using signalfd
+void handle_vt_signals(void) {
+    struct signalfd_siginfo si;
     char time_str[64];
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    time_t now;
+    struct tm *tm_info;
 
-    if (sig == SIGUSR1) {  // VT release signal
-        printf("\n[%s] VT Release signal received (SIGUSR1)\n", time_str);
-        printf("Request to release TTY %d for switching\n", control_config.tty_number);
+    while (running) {
+        struct pollfd pfd[2];
 
-        if (control_config.auto_allow) {
-            printf("Auto-allow mode: Allowing VT switch\n");
-            if (control_config.control_fd != -1) {
-                ioctl(control_config.control_fd, VT_RELDISP, 1);  // Allow release
-            }
-        } else {
-            printf("Allow TTY switch? [y/N]: ");
-            fflush(stdout);
+        // Poll signalfd for VT signals
+        pfd[0].fd = control_config.signal_fd;
+        pfd[0].events = POLLIN;
 
-            char response[10];
-            if (fgets(response, sizeof(response), stdin) != NULL &&
-                (response[0] == 'y' || response[0] == 'Y')) {
-                printf("Allowing VT switch\n");
-                if (control_config.control_fd != -1) {
-                    ioctl(control_config.control_fd, VT_RELDISP, 1);  // Allow release
-                }
-            } else {
-                printf("Denying VT switch\n");
-                if (control_config.control_fd != -1) {
-                    ioctl(control_config.control_fd, VT_RELDISP, 0);  // Deny release
-                }
-            }
+        // Poll stdin for user input (if not auto-allow mode)
+        pfd[1].fd = STDIN_FILENO;
+        pfd[1].events = POLLIN;
+
+        int nfds = control_config.auto_allow ? 1 : 2;
+        int ret = poll(pfd, nfds, -1);
+
+        if (ret == -1) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
         }
-    } else if (sig == SIGUSR2) {  // VT acquire signal
-        printf("\n[%s] VT Acquire signal received (SIGUSR2)\n", time_str);
-        printf("TTY %d has been switched back to us\n", control_config.tty_number);
-        if (control_config.control_fd != -1) {
-            ioctl(control_config.control_fd, VT_RELDISP, VT_ACKACQ);  // Acknowledge acquire
+
+        // Handle VT signals
+        if (pfd[0].revents & POLLIN) {
+            ssize_t s = read(control_config.signal_fd, &si, sizeof(si));
+            if (s == sizeof(si)) {
+                now = time(NULL);
+                tm_info = localtime(&now);
+                strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+
+                if (si.ssi_signo == SIGUSR1) {  // VT release signal
+                    printf("\n[%s] VT Release signal received (SIGUSR1)\n", time_str);
+                    printf("Request to release TTY %d for switching\n", control_config.tty_number);
+
+                    if (control_config.auto_allow) {
+                        printf("Auto-allow mode: Allowing VT switch\n");
+                        if (control_config.control_fd != -1) {
+                            ioctl(control_config.control_fd, VT_RELDISP, 1);  // Allow release
+                        }
+                    } else {
+                        // Interactive mode - ask user
+                        if (ask_user_permission()) {
+                            printf("Allowing VT switch\n");
+                            if (control_config.control_fd != -1) {
+                                ioctl(control_config.control_fd, VT_RELDISP, 1);  // Allow release
+                            }
+                        } else {
+                            printf("Denying VT switch\n");
+                            if (control_config.control_fd != -1) {
+                                ioctl(control_config.control_fd, VT_RELDISP, 0);  // Deny release
+                            }
+                        }
+                    }
+                } else if (si.ssi_signo == SIGUSR2) {  // VT acquire signal
+                    printf("\n[%s] VT Acquire signal received (SIGUSR2)\n", time_str);
+                    printf("TTY %d has been switched back to us\n", control_config.tty_number);
+                    if (control_config.control_fd != -1) {
+                        ioctl(control_config.control_fd, VT_RELDISP, VT_ACKACQ);  // Acknowledge acquire
+                    }
+                } else if (si.ssi_signo == SIGINT || si.ssi_signo == SIGTERM) {
+                    printf("\n[%s] Received termination signal, shutting down...\n", time_str);
+                    running = 0;
+                    break;
+                }
+            }
         }
     }
 }
 
-// General signal handler
+// General signal handler (for non-control modes)
 void signal_handler(int sig) {
     printf("\nReceived signal %d, shutting down...\n", sig);
     running = 0;
@@ -559,9 +605,28 @@ int setup_control_mode(int tty_number, int auto_allow) {
         return -1;
     }
 
-    // Set up signal handlers
-    signal(SIGUSR1, control_signal_handler);
-    signal(SIGUSR2, control_signal_handler);
+    // Setup signalfd for safe signal handling
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGUSR2);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+
+    // Block signals for signalfd
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+        fprintf(stderr, "Failed to block signals: %s\n", strerror(errno));
+        close(control_config.control_fd);
+        return -1;
+    }
+
+    // Create signalfd
+    control_config.signal_fd = signalfd(-1, &mask, SFD_CLOEXEC);
+    if (control_config.signal_fd == -1) {
+        fprintf(stderr, "Failed to create signalfd: %s\n", strerror(errno));
+        close(control_config.control_fd);
+        return -1;
+    }
 
     // Set VT_PROCESS mode
     struct vt_mode new_mode = {
@@ -574,6 +639,7 @@ int setup_control_mode(int tty_number, int auto_allow) {
 
     if (ioctl(control_config.control_fd, VT_SETMODE, &new_mode) == -1) {
         fprintf(stderr, "Failed to set VT_PROCESS mode: %s\n", strerror(errno));
+        close(control_config.signal_fd);
         close(control_config.control_fd);
         return -1;
     }
@@ -595,16 +661,27 @@ void cleanup_control_mode(void) {
 
     printf("Cleaning up VT control mode...\n");
 
+    // Close signalfd
+    if (control_config.signal_fd != -1) {
+        close(control_config.signal_fd);
+        control_config.signal_fd = -1;
+    }
+
+    // Restore signal mask
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGUSR2);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+    sigprocmask(SIG_UNBLOCK, &mask, NULL);
+
     // Restore original VT mode
     if (ioctl(control_config.control_fd, VT_SETMODE, &control_config.original_mode) == -1) {
         fprintf(stderr, "Warning: Failed to restore original VT mode: %s\n", strerror(errno));
     } else {
         printf("Original VT mode restored\n");
     }
-
-    // Restore default signal handlers
-    signal(SIGUSR1, SIG_DFL);
-    signal(SIGUSR2, SIG_DFL);
 
     close(control_config.control_fd);
     control_config.control_fd = -1;
@@ -647,6 +724,10 @@ int main(int argc, char *argv[]) {
     int control_mode = 0;
     int auto_allow = 0;
     int target_tty = -1;
+
+    // Initialize control config
+    control_config.control_fd = -1;
+    control_config.signal_fd = -1;
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -706,10 +787,8 @@ int main(int argc, char *argv[]) {
 
         case MODE_CONTROL:
             if (setup_control_mode(target_tty, auto_allow) == 0) {
-                // Wait for signals in control mode
-                while (running) {
-                    pause(); // Wait for signals
-                }
+                // Handle VT signals using signalfd
+                handle_vt_signals();
                 cleanup_control_mode();
             }
             break;
