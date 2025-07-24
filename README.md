@@ -1,6 +1,6 @@
 # TTY Debug Tool
 
-A simplified tool for monitoring TTY virtual terminal changes and VT control processes, with automatic signal monitoring capabilities.
+A simplified tool for monitoring TTY virtual terminal changes and VT-related processes, with comprehensive signal monitoring for all processes that have TTY devices open.
 
 ## Features
 
@@ -13,8 +13,8 @@ When run without parameters, the tool scans all TTYs (1-12) and displays informa
 
 This mode:
 - Scans TTY 1-12 every 100ms
-- Shows session leader and VT control process information for TTYs in VT_PROCESS mode
-- **Automatically starts signal monitoring** for detected VT control processes using `strace`
+- Shows session leader and all processes that have the TTY device open
+- **Automatically starts signal monitoring** for ALL detected processes using `strace`
 - Reports when TTYs enter or leave VT_PROCESS mode
 - Prints a status message every 5 seconds if no VT_PROCESS TTYs are found
 
@@ -26,10 +26,10 @@ Monitor a specific TTY device for control process and signal changes:
 ```
 
 This mode:
-- Shows initial TTY state (VT mode, session leader, VT control process)
-- **Automatically starts signal monitoring** for VT control processes using `strace`
+- Shows initial TTY state (VT mode, session leader, all processes with TTY open)
+- **Automatically starts signal monitoring** for ALL processes with TTY open using `strace`
 - Monitors for changes every 100ms
-- Reports any changes in VT mode, control process, or session leader
+- Reports any changes in VT mode, control processes, or session leader
 - Works with both VT_AUTO and VT_PROCESS mode TTYs
 
 ### 3. Control Mode
@@ -54,21 +54,33 @@ Control mode features:
 - Auto-allow mode (`-y`): Automatically allows all VT switches
 - Restores original VT mode on exit
 
-## Signal Monitoring Feature
+## Comprehensive Signal Monitoring
+
+### Multi-Process Monitoring
+Instead of trying to identify a single "VT control process", the tool monitors **all processes** that have the TTY device open:
+
+- **systemd-logind**: The actual VT controller that manages VT switching
+- **Display managers**: GDM, LightDM, SDDM processes
+- **Session processes**: User session managers and applications
+- **Other processes**: Any process that opens the TTY device
 
 ### Automatic Signal Tracking
-When a VT control process is detected in monitoring modes, the tool automatically:
+For each detected process, the tool automatically:
 
-1. **Starts `strace`** to monitor signals received by the VT control process
+1. **Starts individual `strace` processes** to monitor signals
 2. **Tracks VT signals** like SIGUSR1 (release) and SIGUSR2 (acquire)
-3. **Shows real-time signal activity** to help debug VT switching behavior
-4. **Manages strace processes** automatically (start/stop/cleanup)
+3. **Shows real-time signal activity** from all monitored processes
+4. **Manages strace processes** automatically (start/stop/cleanup per process)
 
 ### Signal Monitoring Output
 ```bash
-Signal monitoring started for TTY 2 VT control process (PID 1234)
-Monitor PID: 5678
-Starting signal monitoring for PID 1234 (TTY 2)...
+Processes with TTY open (2):
+  1. PID 638 (/usr/lib/systemd/systemd-logind) User: root
+  Signal monitoring started for /usr/lib/systemd/systemd-logind (PID 638) on TTY 2
+  Monitor PID: 847856
+  2. PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
+  Signal monitoring started for /usr/lib/gdm-wayland-session /usr/bin... (PID 816747) on TTY 2
+  Monitor PID: 847860
 ```
 
 ### Requirements
@@ -92,9 +104,9 @@ TTY_DEVICE:
                   For monitor mode: TTY to monitor specifically
 
 Signal Monitoring:
-  In monitoring modes, when a VT control process is detected,
-  strace is automatically started to monitor signals received
-  by the control process. This helps track VT switching activity.
+  In monitoring modes, strace is automatically started for ALL processes
+  that have the TTY device open. This provides comprehensive visibility
+  into VT-related signal activity across the entire system.
 ```
 
 ## Output Information
@@ -105,45 +117,53 @@ For each monitored TTY, the tool displays:
 - **VT Mode**: Current mode (VT_AUTO or VT_PROCESS)
 - **Release/Acquire Signals**: Signal numbers used for VT switching (VT_PROCESS mode only)
 - **Session Leader**: Process ID, command, and user of the session leader
-- **VT Control Process**: Process ID, command, and user of the VT control process (VT_PROCESS mode only)
-- **Signal Monitoring Status**: Whether signal monitoring is active for the control process
+- **All Processes with TTY Open**: Complete list with PIDs, commands, and users
+- **Signal Monitoring Status**: Individual strace monitor for each process
 
-## VT Control Process Detection
+## Process Detection and Privileges
 
-The tool identifies VT control processes using an advanced scoring system that checks:
+The tool detects all processes that have the TTY device file open by examining `/proc/PID/fd/` directories:
 
-1. **Process must have the TTY device open** - Verified by examining `/proc/PID/fd/` links
-2. **Process name and command analysis**:
-   - `systemd-logind`: +100 points (highest priority - the actual VT controller)
-   - Other systemd processes: +50 points
-   - Display managers (gdm, lightdm, sddm): +40 points
-   - Root processes: +25 points bonus
-   - Session leaders: +15 points bonus
-   - Process group leaders: +10 points bonus
+### Detection Method
+1. **Scan all processes** in `/proc/`
+2. **Check file descriptors** in `/proc/PID/fd/` for TTY device links
+3. **Verify TTY device path** using `readlink()` on each file descriptor
+4. **Collect process information** for all matching processes
 
-### Detection Accuracy and Privileges
+### Privilege-Based Results
 
-- **With root privileges (`sudo`)**: Detects the true VT control process (usually `systemd-logind`)
-- **With user privileges**: May detect user-accessible processes that also have the TTY open (like display manager processes)
+- **With root privileges (`sudo`)**:
+  - Detects ALL processes with TTY open (systemd-logind, display managers, user processes)
+  - Provides complete visibility into VT ecosystem
+  - Example: 2+ processes detected for active TTY
+
+- **With user privileges**:
+  - Detects only user-accessible processes
+  - May miss systemd-logind and other system processes
+  - Example: 1 process detected (user's display manager session)
 
 **Example Detection Results:**
 ```bash
 # Normal user
-VT Control Process: PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
+Processes with TTY open (1):
+  1. PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
 
 # With sudo
-VT Control Process: PID 638 (/usr/lib/systemd/systemd-logind) User: root
+Processes with TTY open (2):
+  1. PID 638 (/usr/lib/systemd/systemd-logind) User: root
+  2. PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
 ```
 
-**Recommendation**: Run with `sudo` for the most accurate VT control process identification.
+**Recommendation**: Run with `sudo` for complete process visibility and comprehensive signal monitoring.
 
 ## Use Cases
 
-1. **System Monitoring**: Track which TTYs have active VT control processes
-2. **Desktop Environment Debugging**: Monitor how desktop environments manage VT switching
-3. **Signal Activity Analysis**: See real-time VT signals received by control processes
+1. **System Monitoring**: Track all processes involved in VT management
+2. **Desktop Environment Debugging**: Monitor VT-related processes and their interactions
+3. **Comprehensive Signal Analysis**: See signal activity from all VT-related processes
 4. **VT Switch Control**: Implement custom VT switching policies
-5. **System Administration**: Understand TTY session management
+5. **System Administration**: Understand complete TTY ecosystem
+6. **Security Analysis**: Monitor which processes have access to TTY devices
 
 ## Example Output
 
@@ -151,20 +171,22 @@ VT Control Process: PID 638 (/usr/lib/systemd/systemd-logind) User: root
 TTY Debug Tool - Simplified Version with Signal Monitoring
 ==========================================================
 
-Monitoring all TTYs for VT_PROCESS mode...
+Monitoring TTY 2...
 Checking every 100 ms. Press Ctrl+C to stop.
 Signal monitoring enabled (using strace)
 
-[1753344980] TTY 2 entered VT_PROCESS mode:
 === TTY 2 Information ===
 VT Mode: VT_PROCESS
 Release Signal: 34
 Acquire Signal: 35
 Session Leader: None
-VT Control Process: PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
-  Signal monitoring started for TTY 2 VT control process (PID 816747)
-  Monitor PID: 831846
-  Starting signal monitoring for PID 816747 (TTY 2)...
+Processes with TTY open (2):
+  1. PID 638 (/usr/lib/systemd/systemd-logind) User: root
+  Signal monitoring started for /usr/lib/systemd/systemd-logind (PID 638) on TTY 2
+  Monitor PID: 847856
+  2. PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
+  Signal monitoring started for /usr/lib/gdm-wayland-session /usr/bin... (PID 816747) on TTY 2
+  Monitor PID: 847860
 ```
 
 ## Building
@@ -183,11 +205,13 @@ make
 - Access to `/sys/class/tty/tty0/active` for active TTY detection
 - Appropriate permissions to access TTY devices for control mode
 - **`strace`** for signal monitoring (optional but recommended)
+- **Root privileges recommended** for complete process detection
 
 ## Technical Details
 
 - Monitoring interval: 100ms
 - Supported TTY range: 1-63 (scans 1-12 in monitor-all mode)
 - VT signals: SIGUSR1 (release), SIGUSR2 (acquire)
-- Signal monitoring: Uses `strace -e signal` to track VT control process signals
-- Graceful shutdown on SIGINT/SIGTERM with automatic cleanup of strace processes
+- Process detection: File descriptor analysis via `/proc/PID/fd/`
+- Signal monitoring: Individual `strace -e signal` per detected process
+- Graceful shutdown: Automatic cleanup of all strace processes with SIGTERM/SIGKILL
