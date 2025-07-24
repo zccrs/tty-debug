@@ -702,7 +702,15 @@ void print_tty_info(const tty_info_t *info) {
 
             // Start signal monitoring for each process
             char process_name[128];
-            snprintf(process_name, sizeof(process_name), "%s", info->control_commands[i]);
+            // Safely copy the command, ensuring no truncation warning
+            size_t cmd_len = strlen(info->control_commands[i]);
+            if (cmd_len >= sizeof(process_name)) {
+                // If command is too long, copy first part and add null terminator
+                strncpy(process_name, info->control_commands[i], sizeof(process_name) - 1);
+                process_name[sizeof(process_name) - 1] = '\0';
+            } else {
+                strcpy(process_name, info->control_commands[i]);
+            }
             // Truncate long command lines for display
             if (strlen(process_name) > 40) {
                 strcpy(process_name + 37, "...");
@@ -743,12 +751,12 @@ void monitor_all_ttys(void) {
         int current_active_tty = get_active_tty_from_sysfs();
         if (current_active_tty != -1) {
             if (first_run) {
-                printf("[%ld] Current active TTY: %d\n", time(NULL), current_active_tty);
+                printf("[%ld] Current active TTY: %d\n", (long)time(NULL), current_active_tty);
                 previous_active_tty = current_active_tty;
                 first_run = 0;
             } else if (previous_active_tty != current_active_tty) {
                 printf("[%ld] ★ Active TTY switched: TTY %d → TTY %d\n",
-                       time(NULL), previous_active_tty, current_active_tty);
+                       (long)time(NULL), previous_active_tty, current_active_tty);
                 previous_active_tty = current_active_tty;
             }
         }
@@ -764,18 +772,18 @@ void monitor_all_ttys(void) {
                 // Check if this is a new VT_PROCESS TTY or if details changed
                 if (!has_previous[tty]) {
                     // New VT_PROCESS TTY detected
-                    printf("[%ld] TTY %d entered VT_PROCESS mode:\n", time(NULL), tty);
+                    printf("[%ld] TTY %d entered VT_PROCESS mode:\n", (long)time(NULL), tty);
                     print_tty_info(&current_info);
                     previous_infos[tty] = current_info;
                     has_previous[tty] = 1;
                 } else if (previous_infos[tty].vt_mode != VT_PROCESS) {
                     // TTY changed from VT_AUTO to VT_PROCESS
-                    printf("[%ld] TTY %d changed from VT_AUTO to VT_PROCESS mode:\n", time(NULL), tty);
+                    printf("[%ld] TTY %d changed from VT_AUTO to VT_PROCESS mode:\n", (long)time(NULL), tty);
                     print_tty_info(&current_info);
                     previous_infos[tty] = current_info;
                 } else if (compare_tty_info(&previous_infos[tty], &current_info)) {
                     // VT_PROCESS TTY details changed
-                    printf("[%ld] TTY %d VT_PROCESS details changed:\n", time(NULL), tty);
+                    printf("[%ld] TTY %d VT_PROCESS details changed:\n", (long)time(NULL), tty);
                     print_tty_info(&current_info);
                     previous_infos[tty] = current_info;
                 }
@@ -783,7 +791,7 @@ void monitor_all_ttys(void) {
                 // TTY is not in VT_PROCESS mode
                 if (has_previous[tty] && previous_infos[tty].vt_mode == VT_PROCESS) {
                     // TTY changed from VT_PROCESS to VT_AUTO
-                    printf("[%ld] TTY %d changed from VT_PROCESS to VT_AUTO mode\n", time(NULL), tty);
+                    printf("[%ld] TTY %d changed from VT_PROCESS to VT_AUTO mode\n", (long)time(NULL), tty);
                     // Stop signal monitoring for this TTY
                     stop_all_signal_monitoring_for_tty(tty);
                 }
@@ -794,7 +802,7 @@ void monitor_all_ttys(void) {
                     has_previous[tty] = 1;
                 } else if (has_previous[tty]) {
                     // TTY info unavailable, but we had it before
-                    printf("[%ld] TTY %d no longer accessible\n", time(NULL), tty);
+                    printf("[%ld] TTY %d no longer accessible\n", (long)time(NULL), tty);
                     has_previous[tty] = 0;
                     // Stop signal monitoring for this TTY
                     stop_all_signal_monitoring_for_tty(tty);
@@ -806,7 +814,7 @@ void monitor_all_ttys(void) {
             static time_t last_no_vt_process_msg = 0;
             time_t now = time(NULL);
             if (now - last_no_vt_process_msg >= 5) { // Print every 5 seconds
-                printf("[%ld] No TTYs found in VT_PROCESS mode (Active: TTY %d)\n", now, current_active_tty);
+                printf("[%ld] No TTYs found in VT_PROCESS mode (Active: TTY %d)\n", (long)now, current_active_tty);
                 last_no_vt_process_msg = now;
             }
         }
@@ -842,7 +850,7 @@ void monitor_specific_tty(int tty_number) {
     // Check initial active TTY
     int current_active_tty = get_active_tty_from_sysfs();
     if (current_active_tty != -1) {
-        printf("[%ld] Current active TTY: %d", time(NULL), current_active_tty);
+        printf("[%ld] Current active TTY: %d", (long)time(NULL), current_active_tty);
         if (current_active_tty == tty_number) {
             printf(" (★ Currently monitoring the active TTY)");
         }
@@ -859,7 +867,7 @@ void monitor_specific_tty(int tty_number) {
         current_active_tty = get_active_tty_from_sysfs();
         if (current_active_tty != -1 && previous_active_tty != current_active_tty) {
             printf("[%ld] ★ Active TTY switched: TTY %d → TTY %d",
-                   time(NULL), previous_active_tty, current_active_tty);
+                   (long)time(NULL), previous_active_tty, current_active_tty);
             if (current_active_tty == tty_number) {
                 printf(" (★ Switched TO monitored TTY)");
             } else if (previous_active_tty == tty_number) {
@@ -872,7 +880,7 @@ void monitor_specific_tty(int tty_number) {
         collect_tty_info(tty_number, &current_info);
 
         if (has_previous && compare_tty_info(&previous_info, &current_info)) {
-            printf("[%ld] TTY %d state changed:\n", time(NULL), tty_number);
+            printf("[%ld] TTY %d state changed:\n", (long)time(NULL), tty_number);
             print_tty_info(&current_info);
             previous_info = current_info;
         }
@@ -938,19 +946,25 @@ void handle_vt_signals(void) {
                     if (control_config.auto_allow) {
                         printf("Auto-allow mode: Allowing VT switch\n");
                         if (control_config.control_fd != -1) {
-                            ioctl(control_config.control_fd, VT_RELDISP, 1);  // Allow release
+                            if (ioctl(control_config.control_fd, VT_RELDISP, 1) == -1) {
+                                fprintf(stderr, "Warning: Failed to allow VT release: %s\n", strerror(errno));
+                            }
                         }
                     } else {
                         // Interactive mode - ask user
                         if (ask_user_permission()) {
                             printf("Allowing VT switch\n");
                             if (control_config.control_fd != -1) {
-                                ioctl(control_config.control_fd, VT_RELDISP, 1);  // Allow release
+                                if (ioctl(control_config.control_fd, VT_RELDISP, 1) == -1) {
+                                    fprintf(stderr, "Warning: Failed to allow VT release: %s\n", strerror(errno));
+                                }
                             }
                         } else {
                             printf("Denying VT switch\n");
                             if (control_config.control_fd != -1) {
-                                ioctl(control_config.control_fd, VT_RELDISP, 0);  // Deny release
+                                if (ioctl(control_config.control_fd, VT_RELDISP, 0) == -1) {
+                                    fprintf(stderr, "Warning: Failed to deny VT release: %s\n", strerror(errno));
+                                }
                             }
                         }
                     }
@@ -958,7 +972,9 @@ void handle_vt_signals(void) {
                     printf("\n[%s] VT Acquire signal received (SIGUSR2)\n", time_str);
                     printf("TTY %d has been switched back to us\n", control_config.tty_number);
                     if (control_config.control_fd != -1) {
-                        ioctl(control_config.control_fd, VT_RELDISP, VT_ACKACQ);  // Acknowledge acquire
+                        if (ioctl(control_config.control_fd, VT_RELDISP, VT_ACKACQ) == -1) {
+                            fprintf(stderr, "Warning: Failed to acknowledge VT acquire: %s\n", strerror(errno));
+                        }
                     }
                 } else if (si.ssi_signo == SIGINT || si.ssi_signo == SIGTERM) {
                     printf("\n[%s] Received termination signal, shutting down...\n", time_str);
