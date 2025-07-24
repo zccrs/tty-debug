@@ -434,15 +434,40 @@ void monitor_all_ttys(void) {
             if (current_info.vt_mode == VT_PROCESS) {
                 found_vt_process = 1;
 
-                if (!has_previous[tty] || compare_tty_info(&previous_infos[tty], &current_info)) {
-                    printf("[%ld] TTY %d in VT_PROCESS mode:\n", time(NULL), tty);
+                // Check if this is a new VT_PROCESS TTY or if details changed
+                if (!has_previous[tty]) {
+                    // New VT_PROCESS TTY detected
+                    printf("[%ld] TTY %d entered VT_PROCESS mode:\n", time(NULL), tty);
                     print_tty_info(&current_info);
                     previous_infos[tty] = current_info;
                     has_previous[tty] = 1;
+                } else if (previous_infos[tty].vt_mode != VT_PROCESS) {
+                    // TTY changed from VT_AUTO to VT_PROCESS
+                    printf("[%ld] TTY %d changed from VT_AUTO to VT_PROCESS mode:\n", time(NULL), tty);
+                    print_tty_info(&current_info);
+                    previous_infos[tty] = current_info;
+                } else if (compare_tty_info(&previous_infos[tty], &current_info)) {
+                    // VT_PROCESS TTY details changed
+                    printf("[%ld] TTY %d VT_PROCESS details changed:\n", time(NULL), tty);
+                    print_tty_info(&current_info);
+                    previous_infos[tty] = current_info;
                 }
-            } else if (has_previous[tty] && previous_infos[tty].vt_mode == VT_PROCESS) {
-                printf("[%ld] TTY %d no longer in VT_PROCESS mode\n", time(NULL), tty);
-                has_previous[tty] = 0;
+            } else {
+                // TTY is not in VT_PROCESS mode
+                if (has_previous[tty] && previous_infos[tty].vt_mode == VT_PROCESS) {
+                    // TTY changed from VT_PROCESS to VT_AUTO
+                    printf("[%ld] TTY %d changed from VT_PROCESS to VT_AUTO mode\n", time(NULL), tty);
+                }
+
+                // Always update the current state for proper change detection
+                if (current_info.vt_mode != -1) { // Only if we successfully got TTY info
+                    previous_infos[tty] = current_info;
+                    has_previous[tty] = 1;
+                } else if (has_previous[tty]) {
+                    // TTY info unavailable, but we had it before
+                    printf("[%ld] TTY %d no longer accessible\n", time(NULL), tty);
+                    has_previous[tty] = 0;
+                }
             }
         }
 
