@@ -1,6 +1,6 @@
 # TTY Debug Tool
 
-A simplified tool for monitoring TTY virtual terminal changes and VT-related processes, with comprehensive signal monitoring for all processes that have TTY devices open.
+A simplified tool for monitoring TTY virtual terminal changes and VT-related processes, with comprehensive signal monitoring for all processes that have TTY devices open. The tool tracks VT modes, KD (keyboard display) modes, and provides real-time monitoring of TTY state changes.
 
 ## Features
 
@@ -89,6 +89,20 @@ Active TTY information is integrated into status messages:
 ```
 
 This helps understand the relationship between VT switching behavior and the currently active terminal.
+
+## Keyboard Display (KD) Mode Monitoring
+
+The tool monitors the KD (Keyboard Display) mode of each TTY using the `KDGETMODE` ioctl. The KD mode determines how the TTY handles keyboard input and display output:
+
+- **KD_TEXT**: Text mode - the TTY is in normal console text mode
+- **KD_GRAPHICS**: Graphics mode - the TTY is being used by a graphics application (X11, Wayland compositor, etc.)
+
+KD mode changes are tracked and reported in real-time. This is particularly useful for:
+- Debugging graphics mode transitions
+- Understanding when applications take control of the TTY for graphics rendering
+- Monitoring console ↔ graphics mode switches during session management
+
+The KD mode is displayed alongside VT mode information and is monitored for changes during TTY state monitoring.
 
 ## Comprehensive Signal Monitoring
 
@@ -193,6 +207,7 @@ For each monitored TTY, the tool displays:
 
 - **TTY Number**: The virtual terminal number
 - **VT Mode**: Current mode (VT_AUTO or VT_PROCESS)
+- **KD Mode**: Keyboard display mode (KD_TEXT or KD_GRAPHICS)
 - **Release/Acquire Signals**: Signal numbers used for VT switching (VT_PROCESS mode only)
 - **Session Leader**: Process ID, command, and user of the session leader
 - **All Processes with TTY Open**: Complete list with PIDs, commands, and users
@@ -258,6 +273,7 @@ Active TTY monitoring enabled
 
 === TTY 2 Information ===
 VT Mode: VT_PROCESS
+KD Mode: KD_GRAPHICS
 Release Signal: 34
 Acquire Signal: 35
 Session Leader: None
@@ -301,6 +317,7 @@ make
 - Monitoring interval: 100ms
 - Supported TTY range: 1-63 (scans 1-12 in monitor-all mode)
 - VT signals: SIGUSR1 (release), SIGUSR2 (acquire)
+- KD modes: KD_TEXT (text mode) and KD_GRAPHICS (graphics mode) monitoring via KDGETMODE ioctl
 - Process detection: File descriptor analysis via `/proc/PID/fd/`
 - Signal monitoring: Individual `strace -e signal` per detected process
 - Graceful shutdown: Automatic cleanup of all strace processes with SIGTERM/SIGKILL

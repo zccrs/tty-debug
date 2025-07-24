@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <time.h>
 #include <linux/vt.h>
+#include <linux/kd.h>
 #include <dirent.h>
 #include <sys/wait.h>
 
@@ -49,6 +50,7 @@ typedef struct {
 typedef struct {
     int tty_number;
     int vt_mode;           // VT_AUTO or VT_PROCESS
+    int kd_mode;           // KD_TEXT or KD_GRAPHICS
     int release_signal;
     int acquire_signal;
     pid_t session_leader;
@@ -79,6 +81,8 @@ void print_usage(const char *program_name);
 int parse_tty_device(const char *device_path);
 int get_active_tty_from_sysfs(void);
 int get_vt_mode_details(int tty_number, int *mode, int *release_sig, int *acquire_sig);
+int get_kd_mode(int tty_number);
+const char* kd_mode_to_string(int kd_mode);
 pid_t find_session_leader(int tty_number);
 void get_process_info(pid_t pid, char *command, char *username, uid_t *uid);
 void collect_tty_info(int tty_number, tty_info_t *info);
@@ -510,6 +514,36 @@ int get_vt_mode_details(int tty_number, int *mode, int *release_sig, int *acquir
     return 0;
 }
 
+// Get KD mode
+int get_kd_mode(int tty_number) {
+    char tty_path[MAX_PATH_LEN];
+    snprintf(tty_path, sizeof(tty_path), "/dev/tty%d", tty_number);
+
+    int fd = open(tty_path, O_RDONLY);
+    if (fd == -1) {
+        return -1;
+    }
+
+    int kd_mode;
+    int result = ioctl(fd, KDGETMODE, &kd_mode);
+    close(fd);
+
+    if (result == -1) {
+        return -1;
+    }
+
+    return kd_mode;
+}
+
+// Convert KD mode to string
+const char* kd_mode_to_string(int kd_mode) {
+    switch (kd_mode) {
+        case KD_TEXT: return "KD_TEXT";
+        case KD_GRAPHICS: return "KD_GRAPHICS";
+        default: return "UNKNOWN";
+    }
+}
+
 // Find session leader for a TTY
 pid_t find_session_leader(int tty_number) {
     DIR *proc_dir = opendir("/proc");
@@ -580,6 +614,9 @@ void collect_tty_info(int tty_number, tty_info_t *info) {
 
     // Get VT mode details
     get_vt_mode_details(tty_number, &info->vt_mode, &info->release_signal, &info->acquire_signal);
+
+    // Get KD mode
+    info->kd_mode = get_kd_mode(tty_number);
 
     // Find session leader
     info->session_leader = find_session_leader(tty_number);
@@ -658,6 +695,7 @@ void collect_tty_info(int tty_number, tty_info_t *info) {
 // Compare TTY information for changes
 int compare_tty_info(const tty_info_t *old_info, const tty_info_t *new_info) {
     if (old_info->vt_mode != new_info->vt_mode ||
+        old_info->kd_mode != new_info->kd_mode ||
         old_info->release_signal != new_info->release_signal ||
         old_info->acquire_signal != new_info->acquire_signal ||
         old_info->session_leader != new_info->session_leader ||
@@ -681,6 +719,7 @@ void print_tty_info(const tty_info_t *info) {
 
     printf("=== TTY %d Information ===\n", info->tty_number);
     printf("VT Mode: %s\n", mode_str);
+    printf("KD Mode: %s\n", kd_mode_to_string(info->kd_mode));
 
     if (info->vt_mode == VT_PROCESS) {
         printf("Release Signal: %d\n", info->release_signal);
