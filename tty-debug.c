@@ -1173,7 +1173,80 @@ void check_signal_activity(void) {
     }
 }
 
-// Compare two tty_info_t structures for VT mode changes
+// Compare two vt_control_info_t structures for changes
+int compare_vt_control_info(const vt_control_info_t *old_info, const vt_control_info_t *new_info) {
+    // Check if control process changed
+    if (old_info->pid != new_info->pid) {
+        return 1; // Control process changed
+    }
+
+    // If both are -1 (no control process), no change
+    if (old_info->pid == -1 && new_info->pid == -1) {
+        return 0;
+    }
+
+    // Check if other attributes changed
+    if (old_info->uid != new_info->uid ||
+        old_info->is_session_leader != new_info->is_session_leader ||
+        old_info->has_tty_access != new_info->has_tty_access ||
+        strcmp(old_info->command, new_info->command) != 0 ||
+        strcmp(old_info->user_name, new_info->user_name) != 0) {
+        return 1; // Attributes changed
+    }
+
+    return 0; // No change
+}
+
+// Print VT control process change information
+void print_vt_control_change(const vt_control_info_t *old_info, const vt_control_info_t *new_info, int tty_number) {
+    char time_str[64];
+    get_current_time(time_str, sizeof(time_str));
+
+    printf("[%s] VT Control Process Change Detected on TTY %d:\n", time_str, tty_number);
+
+    if (old_info->pid != new_info->pid) {
+        if (old_info->pid == -1) {
+            printf("  Control Process: None -> PID %d (%s)\n", new_info->pid, new_info->command);
+        } else if (new_info->pid == -1) {
+            printf("  Control Process: PID %d (%s) -> None\n", old_info->pid, old_info->command);
+        } else {
+            printf("  Control Process: PID %d (%s) -> PID %d (%s)\n",
+                   old_info->pid, old_info->command,
+                   new_info->pid, new_info->command);
+        }
+    }
+
+    if (old_info->pid != -1 && new_info->pid != -1 && old_info->pid == new_info->pid) {
+        // Same process, but attributes changed
+        if (old_info->uid != new_info->uid) {
+            printf("  User changed: %s (UID: %d) -> %s (UID: %d)\n",
+                   old_info->user_name, old_info->uid,
+                   new_info->user_name, new_info->uid);
+        }
+        if (old_info->is_session_leader != new_info->is_session_leader) {
+            printf("  Session Leader status changed: %s -> %s\n",
+                   old_info->is_session_leader ? "Yes" : "No",
+                   new_info->is_session_leader ? "Yes" : "No");
+        }
+        if (old_info->has_tty_access != new_info->has_tty_access) {
+            printf("  TTY Access changed: %s -> %s\n",
+                   old_info->has_tty_access ? "Yes" : "No",
+                   new_info->has_tty_access ? "Yes" : "No");
+        }
+    }
+
+    if (new_info->pid != -1) {
+        printf("  Current Control Process: PID %d, User: %s, Command: %s\n",
+               new_info->pid, new_info->user_name, new_info->command);
+        printf("  Session Leader: %s, TTY Access: %s\n",
+               new_info->is_session_leader ? "Yes" : "No",
+               new_info->has_tty_access ? "Yes" : "No");
+    }
+
+    printf("  ---\n");
+}
+
+// Compare two tty_info_t structures for VT mode and control process changes
 int compare_vt_mode_info(const tty_info_t *old_info, const tty_info_t *new_info) {
     if (old_info->tty_number != new_info->tty_number) {
         return 1; // Different TTY, always report
@@ -1185,6 +1258,11 @@ int compare_vt_mode_info(const tty_info_t *old_info, const tty_info_t *new_info)
         return 1; // VT mode changed
     }
 
+    // Check for VT control process changes
+    if (compare_vt_control_info(&old_info->vt_control, &new_info->vt_control)) {
+        return 1; // VT control process changed
+    }
+
     return 0; // No change
 }
 
@@ -1193,30 +1271,52 @@ void print_vt_mode_change(const tty_info_t *old_info, const tty_info_t *new_info
     char time_str[64];
     get_current_time(time_str, sizeof(time_str));
 
-    printf("[%s] VT Mode Change Detected on TTY %d:\n", time_str, new_info->tty_number);
+    int vt_mode_changed = 0;
+    int vt_control_changed = 0;
 
-    if (old_info->vt_mode != new_info->vt_mode) {
-        printf("  Mode: %s -> %s\n",
-               get_vt_mode_string(old_info->vt_mode),
-               get_vt_mode_string(new_info->vt_mode));
+    // Check what changed
+    if (old_info->vt_mode != new_info->vt_mode ||
+        old_info->release_signal != new_info->release_signal ||
+        old_info->acquire_signal != new_info->acquire_signal) {
+        vt_mode_changed = 1;
     }
 
-    if (old_info->release_signal != new_info->release_signal) {
-        printf("  Release Signal: %d -> %d\n",
-               old_info->release_signal, new_info->release_signal);
+    if (compare_vt_control_info(&old_info->vt_control, &new_info->vt_control)) {
+        vt_control_changed = 1;
     }
 
-    if (old_info->acquire_signal != new_info->acquire_signal) {
-        printf("  Acquire Signal: %d -> %d\n",
-               old_info->acquire_signal, new_info->acquire_signal);
+    // Print VT mode changes
+    if (vt_mode_changed) {
+        printf("[%s] VT Mode Change Detected on TTY %d:\n", time_str, new_info->tty_number);
+
+        if (old_info->vt_mode != new_info->vt_mode) {
+            printf("  Mode: %s -> %s\n",
+                   get_vt_mode_string(old_info->vt_mode),
+                   get_vt_mode_string(new_info->vt_mode));
+        }
+
+        if (old_info->release_signal != new_info->release_signal) {
+            printf("  Release Signal: %d -> %d\n",
+                   old_info->release_signal, new_info->release_signal);
+        }
+
+        if (old_info->acquire_signal != new_info->acquire_signal) {
+            printf("  Acquire Signal: %d -> %d\n",
+                   old_info->acquire_signal, new_info->acquire_signal);
+        }
+
+        // Find and display suspects for VT mode change
+        suspect_process_t suspects[MAX_SUSPECTS];
+        int suspect_count = find_vt_mode_suspects(new_info->tty_number, suspects, MAX_SUSPECTS);
+        print_vt_mode_suspects(suspects, suspect_count);
+
+        printf("  ---\n");
     }
 
-    // Find and display suspects
-    suspect_process_t suspects[MAX_SUSPECTS];
-    int suspect_count = find_vt_mode_suspects(new_info->tty_number, suspects, MAX_SUSPECTS);
-    print_vt_mode_suspects(suspects, suspect_count);
-
-    printf("  ---\n");
+    // Print VT control process changes
+    if (vt_control_changed) {
+        print_vt_control_change(&old_info->vt_control, &new_info->vt_control, new_info->tty_number);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -1382,9 +1482,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Monitoring TTY changes, VT mode changes, and VT signal activity...\n");
+    printf("Monitoring TTY changes, VT mode changes, VT control process changes, and VT signal activity...\n");
     printf("Will attempt to identify processes that change VT mode.\n");
-    printf("VT mode will be checked every %d seconds.\n", VT_MODE_CHECK_INTERVAL);
+    printf("VT mode and control process will be checked every %d seconds.\n", VT_MODE_CHECK_INTERVAL);
     printf("Process signals will be checked every %d seconds.\n", PROCESS_CHECK_INTERVAL);
     printf("Press Ctrl+C to stop.\n\n");
 
@@ -1442,7 +1542,7 @@ int main(int argc, char *argv[]) {
 
         time_t current_time = time(NULL);
 
-        // Periodically check VT mode changes on current TTY
+        // Periodically check VT mode and control process changes on current TTY
         if (current_time - last_vt_check >= VT_MODE_CHECK_INTERVAL) {
             last_vt_check = current_time;
 
@@ -1450,10 +1550,10 @@ int main(int argc, char *argv[]) {
             tty_info_t current_info;
             collect_tty_info(current_tty, &current_info);
 
-            // Check if VT mode has changed
+            // Check if VT mode or control process has changed
             if (compare_vt_mode_info(&previous_info, &current_info)) {
                 if (previous_info.tty_number == current_info.tty_number) {
-                    // Same TTY, VT mode changed - analyze suspects
+                    // Same TTY, VT mode or control process changed - analyze and report
                     print_vt_mode_change(&previous_info, &current_info);
 
                     // Update VT signals
