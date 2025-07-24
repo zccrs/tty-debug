@@ -1124,52 +1124,74 @@ void print_tty_info(const tty_info_t *info) {
     printf("\n");
 }
 
-// Print monitored processes
-void print_monitored_processes(void) {
-    printf("=== Monitored Session Processes ===\n");
-    printf("Total processes: %d\n", num_monitored_processes);
-    for (int i = 0; i < num_monitored_processes; i++) {
-        printf("  PID %d: %s (User: %s)\n",
-               monitored_processes[i].pid,
-               monitored_processes[i].command,
-               monitored_processes[i].user_name);
-    }
-    printf("\n");
-}
 
-// Update monitored processes for current TTY
+
+// Update monitored processes for current TTY - only monitor VT control process
 void update_monitored_processes(int tty_number) {
-    num_monitored_processes = find_tty_session_processes(tty_number, monitored_processes, MAX_PROCESSES);
-    if (num_monitored_processes > 0) {
-        printf("Now monitoring %d processes on TTY %d for VT signals (%d, %d)\n",
-               num_monitored_processes, tty_number,
-               current_release_signal, current_acquire_signal);
-        print_monitored_processes();
+    // Clear previous monitored processes
+    num_monitored_processes = 0;
+
+    // Get VT control process information
+    vt_control_info_t vt_control_info;
+    if (get_vt_control_info(tty_number, &vt_control_info) == 0 && vt_control_info.pid != -1) {
+        // Add VT control process to monitored list
+        monitored_processes[0].pid = vt_control_info.pid;
+        strncpy(monitored_processes[0].command, vt_control_info.command, MAX_NAME_LEN - 1);
+        strncpy(monitored_processes[0].user_name, vt_control_info.user_name, MAX_NAME_LEN - 1);
+        monitored_processes[0].uid = vt_control_info.uid;
+        monitored_processes[0].monitoring = 1;
+
+        // Initialize activity monitoring for VT control process
+        get_process_activity_stats(vt_control_info.pid,
+                                 &monitored_processes[0].last_signal_time,
+                                 &monitored_processes[0].last_syscall_time,
+                                 &monitored_processes[0].last_activity_time);
+
+        num_monitored_processes = 1;
+
+        printf("Now monitoring VT control process on TTY %d for VT signals (%d, %d)\n",
+               tty_number, current_release_signal, current_acquire_signal);
+        printf("=== Monitored VT Control Process ===\n");
+        printf("  PID %d: %s (User: %s)\n",
+               monitored_processes[0].pid,
+               monitored_processes[0].command,
+               monitored_processes[0].user_name);
+        printf("  Note: This process receives VT release/acquire signals\n");
+        printf("\n");
+    } else {
+        printf("No VT control process found on TTY %d (VT may not be in VT_PROCESS mode)\n", tty_number);
+        printf("No VT signal monitoring will be performed.\n\n");
     }
 }
 
-// Check for signal activity in monitored processes
+// Check for signal activity in monitored VT control process
 void check_signal_activity(void) {
     char time_str[64];
 
     for (int i = 0; i < num_monitored_processes; i++) {
         if (!monitored_processes[i].monitoring) continue;
 
-        // Check if process still exists
+        // Check if VT control process still exists
         if (kill(monitored_processes[i].pid, 0) == -1) {
+            get_current_time(time_str, sizeof(time_str));
+            printf("[%s] VT control process terminated:\n", time_str);
+            printf("  PID: %d (%s)\n", monitored_processes[i].pid, monitored_processes[i].command);
+            printf("  TTY may no longer have active VT control\n");
+            printf("  ---\n");
             monitored_processes[i].monitoring = 0;
             continue;
         }
 
-        // Check for signal changes
+        // Check for VT signal changes in control process
         if (check_process_signal_change(&monitored_processes[i])) {
             get_current_time(time_str, sizeof(time_str));
-            printf("[%s] Signal activity detected in process:\n", time_str);
+            printf("[%s] VT signal activity detected in control process:\n", time_str);
             printf("  PID: %d\n", monitored_processes[i].pid);
             printf("  Command: %s\n", monitored_processes[i].command);
             printf("  User: %s\n", monitored_processes[i].user_name);
-            printf("  Possible VT signals: Release(%d) or Acquire(%d)\n",
+            printf("  VT signals: Release(%d) or Acquire(%d)\n",
                    current_release_signal, current_acquire_signal);
+            printf("  Note: This is the process that handles VT switching for this TTY\n");
             printf("  ---\n");
         }
     }
@@ -1491,7 +1513,7 @@ int main(int argc, char *argv[]) {
     printf("Monitoring TTY changes, VT mode changes, VT control process changes, and VT signal activity...\n");
     printf("Will attempt to identify processes that change VT mode.\n");
     printf("VT mode and control process will be checked every %d seconds.\n", VT_MODE_CHECK_INTERVAL);
-    printf("Process signals will be checked every %d seconds.\n", PROCESS_CHECK_INTERVAL);
+    printf("VT control process signals will be checked every %d seconds.\n", PROCESS_CHECK_INTERVAL);
     printf("Press Ctrl+C to stop.\n\n");
 
     // Setup poll structure
