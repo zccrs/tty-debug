@@ -816,7 +816,8 @@ void print_usage(const char *program_name) {
     printf("\n");
     printf("Options:\n");
     printf("  -h, --help              Show this help message\n");
-    printf("  -t, --tty=N            Monitor specific TTY number (default: current TTY)\n");
+    printf("  -t, --tty=N            Monitor specific TTY number (default: active TTY from sysfs)\n");
+    printf("                         Use 0 to explicitly monitor the current active TTY from sysfs\n");
     printf("  -c, --control          Enable VT control mode (become VT control process)\n");
     printf("  -s, --silent           Silent mode - automatically allow all VT switches\n");
     printf("                         (only used with --control)\n");
@@ -830,10 +831,11 @@ void print_usage(const char *program_name) {
     printf("  Interactive (-c -i):    Ask user permission for each VT switch (default)\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  %s                     # Monitor current TTY\n", program_name);
+    printf("  %s                     # Monitor active TTY (from sysfs)\n", program_name);
+    printf("  %s -t 0               # Monitor active TTY (same as default)\n", program_name);
     printf("  %s -t 2               # Monitor TTY 2\n", program_name);
-    printf("  %s -c                 # Control current TTY with interactive prompts\n", program_name);
-    printf("  %s -c -s              # Control current TTY, allow all switches\n", program_name);
+    printf("  %s -c                 # Control active TTY with interactive prompts\n", program_name);
+    printf("  %s -c -s              # Control active TTY, allow all switches\n", program_name);
     printf("  %s -c -t 3            # Control TTY 3 with interactive prompts\n", program_name);
     printf("  %s -c -s -t 1         # Control TTY 1, allow all switches\n", program_name);
     printf("\n");
@@ -1361,10 +1363,10 @@ int main(int argc, char *argv[]) {
             if (tty_str) {
                 char *endptr;
                 long tty_num = strtol(tty_str, &endptr, 10);
-                if (*endptr == '\0' && tty_num > 0 && tty_num <= 63) {
+                if (*endptr == '\0' && tty_num >= 0 && tty_num <= 63) {
                     vt_control_config.target_tty = (int)tty_num;
                 } else {
-                    fprintf(stderr, "Error: Invalid TTY number '%s'. Must be 1-63.\n", tty_str);
+                    fprintf(stderr, "Error: Invalid TTY number '%s'. Must be 0-63 (0 = current active TTY).\n", tty_str);
                     return 1;
                 }
             } else {
@@ -1395,22 +1397,26 @@ int main(int argc, char *argv[]) {
     }
 
     // Determine target TTY
-    if (vt_control_config.target_tty == -1) {
-        vt_control_config.target_tty = get_current_tty_number();
+    if (vt_control_config.target_tty == -1 || vt_control_config.target_tty == 0) {
+        // No TTY specified or TTY 0 specified, use current active TTY from sysfs
+        vt_control_config.target_tty = get_active_tty_from_sysfs();
         if (vt_control_config.target_tty == -1) {
+            // If sysfs fails, try to get current TTY for VT control mode
             if (vt_control_config.enabled) {
-                fprintf(stderr, "Error: Could not determine current TTY and no TTY specified.\n");
-                fprintf(stderr, "VT control mode requires running on a virtual terminal (tty1, tty2, etc.)\n");
-                fprintf(stderr, "Use -t option to specify target TTY.\n");
-                return 1;
-            } else {
-                // For monitoring mode, try to get from sysfs
-                vt_control_config.target_tty = get_active_tty_from_sysfs();
+                vt_control_config.target_tty = get_current_tty_number();
                 if (vt_control_config.target_tty == -1) {
-                    fprintf(stderr, "Error: Could not determine target TTY\n");
+                    fprintf(stderr, "Error: Could not determine current TTY and failed to get active TTY from sysfs.\n");
+                    fprintf(stderr, "VT control mode requires running on a virtual terminal (tty1, tty2, etc.)\n");
+                    fprintf(stderr, "Use -t option to specify target TTY.\n");
                     return 1;
                 }
+                printf("Using current TTY (sysfs unavailable): %d\n", vt_control_config.target_tty);
+            } else {
+                fprintf(stderr, "Error: Could not get active TTY from sysfs (%s)\n", SYSFS_TTY0_ACTIVE);
+                return 1;
             }
+        } else {
+            printf("Using active TTY from sysfs: %d\n", vt_control_config.target_tty);
         }
     }
 

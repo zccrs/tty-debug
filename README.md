@@ -60,14 +60,21 @@ clang -Wall -Wextra -std=c99 -o tty-debug tty-debug.c
 
 # 监控模式（默认）
 ./tty-debug              # 监控当前TTY
+./tty-debug -t 0         # 监控当前活跃TTY（从sysfs获取）
 ./tty-debug -t 2         # 监控指定TTY 2
 
 # VT控制模式
 ./tty-debug -c           # 成为当前TTY的VT控制进程
 ./tty-debug -c -s        # 静默模式，自动允许所有VT切换
+./tty-debug -c -t 0      # 控制当前活跃TTY（从sysfs获取）
 ./tty-debug -c -t 3      # 控制指定TTY 3
 ./tty-debug -c -s -t 1   # 静默模式控制TTY 1
 ```
+
+#### TTY参数说明
+- **无参数**：自动检测当前运行程序的TTY
+- **`-t 0`**：使用`/sys/class/tty/tty0/active`中的活跃TTY
+- **`-t N`**：指定具体的TTY号码（1-63）
 
 ### 基本使用
 ```bash
@@ -209,6 +216,18 @@ clang -Wall -Wextra -std=c99 -o test_vt_control test_vt_control.c
 2. 新进程成为VT控制进程的检测
 3. VT控制进程属性变化监控
 4. VT控制进程消失的检测
+
+### 测试活跃TTY监控功能
+```bash
+# 运行活跃TTY监控测试（-t 0参数）
+./test_tty_zero_parameter.sh
+```
+
+该脚本将演示：
+1. 使用`-t 0`自动监控活跃TTY
+2. 与手动指定TTY的区别
+3. 动态TTY监控的用例
+4. sysfs TTY信息的获取
 
 ### 完整功能演示
 运行完整的演示脚本：
