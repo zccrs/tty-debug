@@ -77,10 +77,52 @@ For each detected process, the tool automatically:
 Processes with TTY open (2):
   1. PID 638 (/usr/lib/systemd/systemd-logind) User: root
   Signal monitoring started for /usr/lib/systemd/systemd-logind (PID 638) on TTY 2
-  Monitor PID: 847856
+  Strace PID: 847856, Parser PID: 847857
   2. PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
   Signal monitoring started for /usr/lib/gdm-wayland-session /usr/bin... (PID 816747) on TTY 2
-  Monitor PID: 847860
+  Strace PID: 847860, Parser PID: 847861
+
+# When VT signals are received:
+[TTY2][systemd-logind PID 638] Signal received: VT Release Signal (34) - Request to release VT for switching
+[TTY2][gnome-session PID 816747] Signal received: VT Acquire Signal (35) - VT switched back to this process
+```
+
+### Enhanced Signal Information
+The tool now provides detailed context for each signal:
+
+- **Process Identification**: `[TTY2][process_name PID 1234]`
+- **Signal Interpretation**: Automatically explains VT Release/Acquire signals
+- **Standard Signals**: Recognizes SIGINT, SIGTERM, SIGKILL, etc.
+- **Real-time Signals**: Interprets SIGRT_X format signals
+- **Context-Aware**: Uses TTY's actual release/acquire signal numbers
+
+Example signal interpretations:
+- `VT Release Signal (34) - Request to release VT for switching`
+- `VT Acquire Signal (35) - VT switched back to this process`
+- `SIGRT_3 (35) - Real-time signal` (for non-VT real-time signals)
+- `SIGTERM (15) - Termination signal`
+
+### Troubleshooting Signal Monitoring
+
+If you see permission errors like:
+```bash
+[TTY2][systemd-logind PID 638] strace: attach: ptrace(PTRACE_SEIZE, 638): Operation not permitted
+```
+
+This is due to ptrace restrictions. The tool will automatically suggest:
+```bash
+Note: ptrace is restricted (scope=1). To enable signal monitoring:
+sudo sysctl kernel.yama.ptrace_scope=0
+```
+
+To temporarily allow ptrace for testing:
+```bash
+sudo sysctl kernel.yama.ptrace_scope=0
+```
+
+To permanently allow ptrace (less secure):
+```bash
+echo 'kernel.yama.ptrace_scope = 0' | sudo tee -a /etc/sysctl.conf
 ```
 
 ### Requirements

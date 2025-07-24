@@ -39,6 +39,7 @@ typedef enum {
 typedef struct {
     pid_t target_pid;      // PID being monitored
     pid_t strace_pid;      // strace process PID
+    pid_t parser_pid;      // signal parser process PID
     int tty_number;        // TTY number for this monitor
     int active;            // Whether monitoring is active
     time_t start_time;     // When monitoring started
@@ -99,6 +100,7 @@ void stop_all_signal_monitoring_for_tty(int tty_number);
 void cleanup_all_signal_monitors(void);
 int is_strace_available(void);
 int get_monitor_index(pid_t target_pid, int tty_number);
+const char* interpret_signal(int signal_num, int release_sig, int acquire_sig);
 
 // Helper function to compare PIDs for sorting
 int compare_pids(const void *a, const void *b) {
@@ -127,6 +129,29 @@ int find_free_monitor_slot(void) {
         }
     }
     return -1;
+}
+
+// Interpret VT signals
+const char* interpret_signal(int signal_num, int release_sig, int acquire_sig) {
+    static char result[128];
+
+    if (signal_num == release_sig) {
+        snprintf(result, sizeof(result), "VT Release Signal (%d) - Request to release VT for switching", signal_num);
+    } else if (signal_num == acquire_sig) {
+        snprintf(result, sizeof(result), "VT Acquire Signal (%d) - VT switched back to this process", signal_num);
+    } else if (signal_num == 2) {
+        snprintf(result, sizeof(result), "SIGINT (%d) - Interrupt signal", signal_num);
+    } else if (signal_num == 15) {
+        snprintf(result, sizeof(result), "SIGTERM (%d) - Termination signal", signal_num);
+    } else if (signal_num == 9) {
+        snprintf(result, sizeof(result), "SIGKILL (%d) - Kill signal", signal_num);
+    } else if (signal_num >= 34 && signal_num <= 64) {
+        snprintf(result, sizeof(result), "SIGRT_%d (%d) - Real-time signal", signal_num - 32, signal_num);
+    } else {
+        snprintf(result, sizeof(result), "Signal %d", signal_num);
+    }
+
+    return result;
 }
 
 // Check if strace is available
@@ -159,10 +184,23 @@ int start_signal_monitoring_for_pid(pid_t target_pid, int tty_number, const char
         return -1;
     }
 
+    // Get VT signal information for interpretation
+    int vt_mode, release_sig, acquire_sig;
+    get_vt_mode_details(tty_number, &vt_mode, &release_sig, &acquire_sig);
+
+    // Create pipe for strace output
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        perror("Failed to create pipe for strace");
+        return -1;
+    }
+
     // Fork to run strace
     pid_t strace_pid = fork();
     if (strace_pid == -1) {
         perror("Failed to fork for strace");
+        close(pipefd[0]);
+        close(pipefd[1]);
         return -1;
     }
 
@@ -171,18 +209,19 @@ int start_signal_monitoring_for_pid(pid_t target_pid, int tty_number, const char
         char pid_str[32];
         snprintf(pid_str, sizeof(pid_str), "%d", target_pid);
 
-        printf("  Starting signal monitoring for %s (PID %d, TTY %d)...\n", process_name, target_pid, tty_number);
-        fflush(stdout);
+        // Close read end of pipe
+        close(pipefd[0]);
 
-        // Redirect stderr to stdout for easier parsing
-        dup2(STDOUT_FILENO, STDERR_FILENO);
+        // Redirect stdout and stderr to pipe
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
 
         // Execute strace to monitor signals
         execl("/usr/bin/strace", "strace",
               "-p", pid_str,           // Attach to process
               "-e", "signal",          // Only trace signals
               "-q",                    // Quiet mode
-              "-o", "/dev/stdout",     // Output to stdout
               NULL);
 
         // If execl fails
@@ -190,9 +229,77 @@ int start_signal_monitoring_for_pid(pid_t target_pid, int tty_number, const char
         exit(1);
     }
 
-    // Parent process: record monitoring info
+    // Parent process: close write end and fork signal parser
+    close(pipefd[1]);
+
+    pid_t parser_pid = fork();
+    if (parser_pid == -1) {
+        perror("Failed to fork signal parser");
+        close(pipefd[0]);
+        kill(strace_pid, SIGTERM);
+        waitpid(strace_pid, NULL, 0);
+        return -1;
+    }
+
+    if (parser_pid == 0) {
+        // Signal parser process
+        FILE *pipe_stream = fdopen(pipefd[0], "r");
+        if (!pipe_stream) {
+            perror("Failed to open pipe stream");
+            exit(1);
+        }
+
+        char line[1024];
+        while (fgets(line, sizeof(line), pipe_stream)) {
+            // Remove newline
+            char *newline = strchr(line, '\n');
+            if (newline) *newline = '\0';
+
+            // Parse signal information from strace output
+            // Look for patterns like "--- SIGRT_3 {si_signo=SIGRT_3, si_code=SI_KERNEL} ---"
+            if (strstr(line, "---") && strstr(line, "si_signo=")) {
+                char *signo_start = strstr(line, "si_signo=");
+                if (signo_start) {
+                    int signal_num = 0;
+
+                    // Try to parse SIGRT_X format
+                    if (sscanf(signo_start, "si_signo=SIGRT_%d", &signal_num) == 1) {
+                        signal_num += 32; // SIGRT_X = 32 + X
+                    }
+                    // Try to parse direct number format
+                    else if (sscanf(signo_start, "si_signo=%d", &signal_num) == 1) {
+                        // Number parsed directly
+                    }
+
+                    if (signal_num > 0) {
+                        printf("[TTY%d][%s PID %d] Signal received: %s\n",
+                               tty_number, process_name, target_pid,
+                               interpret_signal(signal_num, release_sig, acquire_sig));
+                    } else {
+                        printf("[TTY%d][%s PID %d] %s\n", tty_number, process_name, target_pid, line);
+                    }
+                } else {
+                    printf("[TTY%d][%s PID %d] %s\n", tty_number, process_name, target_pid, line);
+                }
+            } else {
+                // Print other strace output as-is with context
+                if (strlen(line) > 0) {
+                    printf("[TTY%d][%s PID %d] %s\n", tty_number, process_name, target_pid, line);
+                }
+            }
+            fflush(stdout);
+        }
+
+        fclose(pipe_stream);
+        exit(0);
+    }
+
+    // Parent process: close read end and record monitoring info
+    close(pipefd[0]);
+
     monitor->target_pid = target_pid;
     monitor->strace_pid = strace_pid;
+    monitor->parser_pid = parser_pid;
     monitor->tty_number = tty_number;
     monitor->active = 1;
     monitor->start_time = time(NULL);
@@ -201,7 +308,18 @@ int start_signal_monitoring_for_pid(pid_t target_pid, int tty_number, const char
 
     printf("  Signal monitoring started for %s (PID %d) on TTY %d\n",
            process_name, target_pid, tty_number);
-    printf("  Monitor PID: %d\n", strace_pid);
+    printf("  Strace PID: %d, Parser PID: %d\n", strace_pid, parser_pid);
+
+    // Check if ptrace is restricted
+    FILE *yama_file = fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
+    if (yama_file) {
+        int ptrace_scope;
+        if (fscanf(yama_file, "%d", &ptrace_scope) == 1 && ptrace_scope > 0) {
+            printf("  Note: ptrace is restricted (scope=%d). To enable signal monitoring:\n", ptrace_scope);
+            printf("  sudo sysctl kernel.yama.ptrace_scope=0\n");
+        }
+        fclose(yama_file);
+    }
 
     return 0;
 }
@@ -228,6 +346,21 @@ void stop_signal_monitoring_for_pid(pid_t target_pid, int tty_number) {
             usleep(100000); // 100ms
             kill(monitor->strace_pid, SIGKILL);
             waitpid(monitor->strace_pid, &status, 0);
+        }
+    }
+
+    // Kill the parser process
+    if (monitor->parser_pid > 0) {
+        kill(monitor->parser_pid, SIGTERM);
+
+        // Wait briefly for graceful termination
+        int status;
+        pid_t result = waitpid(monitor->parser_pid, &status, WNOHANG);
+        if (result == 0) {
+            // Still running, force kill
+            usleep(100000); // 100ms
+            kill(monitor->parser_pid, SIGKILL);
+            waitpid(monitor->parser_pid, &status, 0);
         }
     }
 
