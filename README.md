@@ -13,6 +13,7 @@ When run without parameters, the tool scans all TTYs (1-12) and displays informa
 
 This mode:
 - Scans TTY 1-12 every 100ms
+- **Monitors active TTY changes** and reports TTY switching events
 - Shows session leader and all processes that have the TTY device open
 - **Automatically starts signal monitoring** for ALL detected processes using `strace`
 - Reports when TTYs enter or leave VT_PROCESS mode
@@ -26,6 +27,7 @@ Monitor a specific TTY device for control process and signal changes:
 ```
 
 This mode:
+- **Monitors active TTY changes** with special indicators for the monitored TTY
 - Shows initial TTY state (VT mode, session leader, all processes with TTY open)
 - **Automatically starts signal monitoring** for ALL processes with TTY open using `strace`
 - Monitors for changes every 100ms
@@ -53,6 +55,40 @@ Control mode features:
 - Interactive mode: Prompts user for permission on VT switch requests
 - Auto-allow mode (`-y`): Automatically allows all VT switches
 - Restores original VT mode on exit
+
+## Active TTY Monitoring
+
+### Real-time VT Switching Detection
+The tool continuously monitors the active TTY by reading `/sys/class/tty/tty0/active` and reports all switching events:
+
+```bash
+[1753347620] Current active TTY: 2
+[1753347625] ★ Active TTY switched: TTY 2 → TTY 3
+[1753347630] ★ Active TTY switched: TTY 3 → TTY 1
+```
+
+### Context-Aware Indicators
+When monitoring a specific TTY, the tool provides special indicators:
+
+```bash
+# Initial state
+[1753347679] Current active TTY: 2 (★ Currently monitoring the active TTY)
+
+# Switching TO monitored TTY
+[1753347684] ★ Active TTY switched: TTY 3 → TTY 2 (★ Switched TO monitored TTY)
+
+# Switching FROM monitored TTY
+[1753347689] ★ Active TTY switched: TTY 2 → TTY 1 (★ Switched FROM monitored TTY)
+```
+
+### Integration with Process Monitoring
+Active TTY information is integrated into status messages:
+
+```bash
+[1753347620] No TTYs found in VT_PROCESS mode (Active: TTY 2)
+```
+
+This helps understand the relationship between VT switching behavior and the currently active terminal.
 
 ## Comprehensive Signal Monitoring
 
@@ -216,6 +252,9 @@ TTY Debug Tool - Simplified Version with Signal Monitoring
 Monitoring TTY 2...
 Checking every 100 ms. Press Ctrl+C to stop.
 Signal monitoring enabled (using strace)
+Active TTY monitoring enabled
+
+[1753347679] Current active TTY: 2 (★ Currently monitoring the active TTY)
 
 === TTY 2 Information ===
 VT Mode: VT_PROCESS
@@ -225,10 +264,18 @@ Session Leader: None
 Processes with TTY open (2):
   1. PID 638 (/usr/lib/systemd/systemd-logind) User: root
   Signal monitoring started for /usr/lib/systemd/systemd-logind (PID 638) on TTY 2
-  Monitor PID: 847856
+  Strace PID: 847856, Parser PID: 847857
   2. PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
   Signal monitoring started for /usr/lib/gdm-wayland-session /usr/bin... (PID 816747) on TTY 2
-  Monitor PID: 847860
+  Strace PID: 847860, Parser PID: 847861
+
+# When VT switching occurs:
+[1753347684] ★ Active TTY switched: TTY 2 → TTY 3 (★ Switched FROM monitored TTY)
+[1753347689] ★ Active TTY switched: TTY 3 → TTY 2 (★ Switched TO monitored TTY)
+
+# When VT signals are received:
+[TTY2][systemd-logind PID 638] Signal received: VT Release Signal (34) - Request to release VT for switching
+[TTY2][gnome-session PID 816747] Signal received: VT Acquire Signal (35) - VT switched back to this process
 ```
 
 ## Building

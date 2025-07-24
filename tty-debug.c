@@ -220,7 +220,8 @@ int start_signal_monitoring_for_pid(pid_t target_pid, int tty_number, const char
         // Execute strace to monitor signals
         execl("/usr/bin/strace", "strace",
               "-p", pid_str,           // Attach to process
-              "-e", "signal",          // Only trace signals
+              "-e", "trace=none",      // Don't trace system calls
+              "-e", "signal=all",      // But do trace signal deliveries
               "-q",                    // Quiet mode
               NULL);
 
@@ -724,16 +725,34 @@ void monitor_all_ttys(void) {
     printf("Checking every %d ms. Press Ctrl+C to stop.\n", MONITOR_INTERVAL_MS);
 
     if (is_strace_available()) {
-        printf("Signal monitoring enabled (using strace)\n\n");
+        printf("Signal monitoring enabled (using strace)\n");
     } else {
-        printf("Signal monitoring disabled (strace not available)\n\n");
+        printf("Signal monitoring disabled (strace not available)\n");
     }
+
+    printf("Active TTY monitoring enabled\n\n");
 
     tty_info_t previous_infos[64] = {0}; // TTY 1-63
     int has_previous[64] = {0};
+    int previous_active_tty = -1;
+    int first_run = 1;
 
     while (running) {
         int found_vt_process = 0;
+
+        // Check and report active TTY changes
+        int current_active_tty = get_active_tty_from_sysfs();
+        if (current_active_tty != -1) {
+            if (first_run) {
+                printf("[%ld] Current active TTY: %d\n", time(NULL), current_active_tty);
+                previous_active_tty = current_active_tty;
+                first_run = 0;
+            } else if (previous_active_tty != current_active_tty) {
+                printf("[%ld] ★ Active TTY switched: TTY %d → TTY %d\n",
+                       time(NULL), previous_active_tty, current_active_tty);
+                previous_active_tty = current_active_tty;
+            }
+        }
 
         // Check TTY 1-12 (common range)
         for (int tty = 1; tty <= 12; tty++) {
@@ -788,7 +807,7 @@ void monitor_all_ttys(void) {
             static time_t last_no_vt_process_msg = 0;
             time_t now = time(NULL);
             if (now - last_no_vt_process_msg >= 5) { // Print every 5 seconds
-                printf("[%ld] No TTYs found in VT_PROCESS mode\n", now);
+                printf("[%ld] No TTYs found in VT_PROCESS mode (Active: TTY %d)\n", now, current_active_tty);
                 last_no_vt_process_msg = now;
             }
         }
@@ -806,22 +825,53 @@ void monitor_specific_tty(int tty_number) {
     printf("Checking every %d ms. Press Ctrl+C to stop.\n", MONITOR_INTERVAL_MS);
 
     if (is_strace_available()) {
-        printf("Signal monitoring enabled (using strace)\n\n");
+        printf("Signal monitoring enabled (using strace)\n");
     } else {
-        printf("Signal monitoring disabled (strace not available)\n\n");
+        printf("Signal monitoring disabled (strace not available)\n");
     }
+
+    printf("Active TTY monitoring enabled\n\n");
 
     tty_info_t previous_info = {0};
     int has_previous = 0;
+    int previous_active_tty = -1;
+    int first_run = 1;
 
     // Show initial state
     tty_info_t current_info;
     collect_tty_info(tty_number, &current_info);
+
+    // Check initial active TTY
+    int current_active_tty = get_active_tty_from_sysfs();
+    if (current_active_tty != -1) {
+        printf("[%ld] Current active TTY: %d", time(NULL), current_active_tty);
+        if (current_active_tty == tty_number) {
+            printf(" (★ Currently monitoring the active TTY)");
+        }
+        printf("\n\n");
+        previous_active_tty = current_active_tty;
+        first_run = 0;
+    }
+
     print_tty_info(&current_info);
     previous_info = current_info;
     has_previous = 1;
 
     while (running) {
+        // Check and report active TTY changes
+        current_active_tty = get_active_tty_from_sysfs();
+        if (current_active_tty != -1 && previous_active_tty != current_active_tty) {
+            printf("[%ld] ★ Active TTY switched: TTY %d → TTY %d",
+                   time(NULL), previous_active_tty, current_active_tty);
+            if (current_active_tty == tty_number) {
+                printf(" (★ Switched TO monitored TTY)");
+            } else if (previous_active_tty == tty_number) {
+                printf(" (★ Switched FROM monitored TTY)");
+            }
+            printf("\n");
+            previous_active_tty = current_active_tty;
+        }
+
         collect_tty_info(tty_number, &current_info);
 
         if (has_previous && compare_tty_info(&previous_info, &current_info)) {
