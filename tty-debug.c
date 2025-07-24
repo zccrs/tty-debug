@@ -398,6 +398,9 @@ pid_t find_vt_control_process(int tty_number) {
         return -1; // Not in process control mode
     }
 
+    char tty_path[MAX_PATH_LEN];
+    snprintf(tty_path, sizeof(tty_path), "/dev/tty%d", tty_number);
+
     DIR *proc_dir = opendir("/proc");
     if (!proc_dir) return -1;
 
@@ -412,46 +415,122 @@ pid_t find_vt_control_process(int tty_number) {
         long pid = strtol(entry->d_name, &endptr, 10);
         if (*endptr != '\0' || pid <= 0) continue;
 
-        // Check if process is associated with our TTY
+        // Check if process has the TTY device open
+        char fd_dir_path[MAX_PATH_LEN];
+        snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%ld/fd", pid);
+
+        DIR *fd_dir = opendir(fd_dir_path);
+        if (!fd_dir) continue;
+
+        int has_tty_open = 0;
+        struct dirent *fd_entry;
+        while ((fd_entry = readdir(fd_dir)) != NULL) {
+            if (fd_entry->d_type != DT_LNK) continue;
+
+            char fd_path[MAX_PATH_LEN];
+            char link_target[MAX_PATH_LEN];
+            snprintf(fd_path, sizeof(fd_path), "/proc/%ld/fd/%s", pid, fd_entry->d_name);
+
+            ssize_t len = readlink(fd_path, link_target, sizeof(link_target) - 1);
+            if (len > 0) {
+                link_target[len] = '\0';
+                if (strcmp(link_target, tty_path) == 0) {
+                    has_tty_open = 1;
+                    break;
+                }
+            }
+        }
+        closedir(fd_dir);
+
+        if (!has_tty_open) continue;
+
+        // Score this process as potential VT control process
+        int score = 20; // Base score for having TTY open
+
+        // Check process name for systemd-logind (highest priority)
+        char comm_path[MAX_PATH_LEN];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%ld/comm", pid);
+        FILE *comm_file = fopen(comm_path, "r");
+        if (comm_file) {
+            char comm[256];
+            if (fgets(comm, sizeof(comm), comm_file)) {
+                // Remove newline
+                char *newline = strchr(comm, '\n');
+                if (newline) *newline = '\0';
+
+                if (strstr(comm, "systemd-logind") || strstr(comm, "logind")) {
+                    score += 100; // Very high priority for systemd-logind
+                } else if (strstr(comm, "systemd")) {
+                    score += 50; // High priority for other systemd processes
+                } else if (strstr(comm, "gdm") || strstr(comm, "lightdm") || strstr(comm, "sddm")) {
+                    score += 40; // High priority for display managers
+                }
+            }
+            fclose(comm_file);
+        }
+
+        // Check process cmdline for additional context
+        char cmdline_path[MAX_PATH_LEN];
+        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%ld/cmdline", pid);
+        FILE *cmdline_file = fopen(cmdline_path, "rb");
+        if (cmdline_file) {
+            char cmdline[1024];
+            size_t bytes_read = fread(cmdline, 1, sizeof(cmdline) - 1, cmdline_file);
+            if (bytes_read > 0) {
+                cmdline[bytes_read] = '\0';
+                if (strstr(cmdline, "systemd-logind")) {
+                    score += 80;
+                } else if (strstr(cmdline, "login")) {
+                    score += 30;
+                }
+            }
+            fclose(cmdline_file);
+        }
+
+        // Check if session leader
         char stat_path[MAX_PATH_LEN];
         snprintf(stat_path, sizeof(stat_path), "/proc/%ld/stat", pid);
         FILE *stat_file = fopen(stat_path, "r");
-        if (!stat_file) continue;
+        if (stat_file) {
+            char stat_line[1024];
+            if (fgets(stat_line, sizeof(stat_line), stat_file)) {
+                char *token = strtok(stat_line, " ");
+                for (int i = 0; i < 4 && token; i++) {
+                    token = strtok(NULL, " ");
+                }
 
-        char stat_line[1024];
-        if (!fgets(stat_line, sizeof(stat_line), stat_file)) {
+                if (token) {
+                    pid_t session_id = atoi(token);
+                    if (session_id == pid) {
+                        score += 15; // Bonus for session leader
+                    }
+                }
+
+                // Check if process group leader
+                token = strtok(NULL, " ");
+                if (token && atoi(token) == pid) {
+                    score += 10; // Bonus for process group leader
+                }
+            }
             fclose(stat_file);
-            continue;
-        }
-        fclose(stat_file);
-
-        // Parse TTY from stat file
-        char *token = strtok(stat_line, " ");
-        for (int i = 0; i < 6 && token; i++) {
-            token = strtok(NULL, " ");
         }
 
-        if (!token) continue;
-
-        int proc_tty = atoi(token);
-        int major = (proc_tty >> 8) & 0xff;
-        int minor = proc_tty & 0xff;
-
-        if (major != 4 || minor != tty_number) continue;
-
-        // Score this process as potential VT control process
-        int score = 10; // Base score for TTY association
-
-        // Check if session leader (higher score)
-        char *session_token = strtok(NULL, " ");
-        if (session_token && atoi(session_token) == pid) {
-            score += 30;
-        }
-
-        // Check if process group leader
-        char *pgrp_token = strtok(NULL, " ");
-        if (pgrp_token && atoi(pgrp_token) == pid) {
-            score += 20;
+        // Check process UID (root processes get higher score)
+        char status_path[MAX_PATH_LEN];
+        snprintf(status_path, sizeof(status_path), "/proc/%ld/status", pid);
+        FILE *status_file = fopen(status_path, "r");
+        if (status_file) {
+            char line[256];
+            while (fgets(line, sizeof(line), status_file)) {
+                if (strncmp(line, "Uid:", 4) == 0) {
+                    int uid;
+                    if (sscanf(line, "Uid:\t%d", &uid) == 1 && uid == 0) {
+                        score += 25; // Bonus for root processes
+                    }
+                    break;
+                }
+            }
+            fclose(status_file);
         }
 
         if (score > best_score) {
@@ -527,6 +606,7 @@ void print_tty_info(const tty_info_t *info) {
             }
         } else {
             printf("None found\n");
+            printf("  Note: Run with sudo for better VT control process detection\n");
         }
     } else {
         // Stop signal monitoring if TTY is no longer in VT_PROCESS mode

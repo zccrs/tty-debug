@@ -110,10 +110,32 @@ For each monitored TTY, the tool displays:
 
 ## VT Control Process Detection
 
-The tool identifies VT control processes using several criteria:
-- Must be associated with the target TTY
-- Higher score for session leaders and process group leaders
-- Must exist when TTY is in VT_PROCESS mode
+The tool identifies VT control processes using an advanced scoring system that checks:
+
+1. **Process must have the TTY device open** - Verified by examining `/proc/PID/fd/` links
+2. **Process name and command analysis**:
+   - `systemd-logind`: +100 points (highest priority - the actual VT controller)
+   - Other systemd processes: +50 points
+   - Display managers (gdm, lightdm, sddm): +40 points
+   - Root processes: +25 points bonus
+   - Session leaders: +15 points bonus
+   - Process group leaders: +10 points bonus
+
+### Detection Accuracy and Privileges
+
+- **With root privileges (`sudo`)**: Detects the true VT control process (usually `systemd-logind`)
+- **With user privileges**: May detect user-accessible processes that also have the TTY open (like display manager processes)
+
+**Example Detection Results:**
+```bash
+# Normal user
+VT Control Process: PID 816747 (/usr/lib/gdm-wayland-session /usr/bin/gnome-session) User: zccrs
+
+# With sudo
+VT Control Process: PID 638 (/usr/lib/systemd/systemd-logind) User: root
+```
+
+**Recommendation**: Run with `sudo` for the most accurate VT control process identification.
 
 ## Use Cases
 
