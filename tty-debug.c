@@ -1,7 +1,6 @@
 // Copyright (C) 2025 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -620,7 +619,7 @@ void collect_tty_info(int tty_number, tty_info_t *info) {
         while ((fd_entry = readdir(fd_dir)) != NULL) {
             if (fd_entry->d_type != DT_LNK) continue;
 
-            char fd_path[MAX_PATH_LEN];
+            char fd_path[512];  // Increased buffer size to prevent truncation
             char link_target[MAX_PATH_LEN];
             snprintf(fd_path, sizeof(fd_path), "/proc/%ld/fd/%s", pid, fd_entry->d_name);
 
@@ -835,7 +834,6 @@ void monitor_specific_tty(int tty_number) {
     tty_info_t previous_info = {0};
     int has_previous = 0;
     int previous_active_tty = -1;
-    int first_run = 1;
 
     // Show initial state
     tty_info_t current_info;
@@ -850,7 +848,6 @@ void monitor_specific_tty(int tty_number) {
         }
         printf("\n\n");
         previous_active_tty = current_active_tty;
-        first_run = 0;
     }
 
     print_tty_info(&current_info);
