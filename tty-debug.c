@@ -35,6 +35,15 @@ typedef enum {
     MODE_CONTROL           // Control mode
 } program_mode_t;
 
+// Signal monitoring structure for VT control processes
+typedef struct {
+    pid_t target_pid;      // PID being monitored
+    pid_t strace_pid;      // strace process PID
+    int tty_number;        // TTY number for this monitor
+    int active;            // Whether monitoring is active
+    time_t start_time;     // When monitoring started
+} signal_monitor_t;
+
 // TTY information structure
 typedef struct {
     int tty_number;
@@ -61,6 +70,7 @@ typedef struct {
 } control_config_t;
 
 static control_config_t control_config = {0};
+static signal_monitor_t signal_monitors[64] = {0}; // Monitor for each TTY
 
 // Function declarations
 void print_usage(const char *program_name);
@@ -80,6 +90,120 @@ void cleanup_control_mode(void);
 void handle_vt_signals(void);
 int ask_user_permission(void);
 void signal_handler(int sig);
+
+// Signal monitoring functions
+int start_signal_monitoring(pid_t target_pid, int tty_number);
+void stop_signal_monitoring(int tty_number);
+void cleanup_all_signal_monitors(void);
+int is_strace_available(void);
+
+// Check if strace is available
+int is_strace_available(void) {
+    int ret = system("which strace >/dev/null 2>&1");
+    return WEXITSTATUS(ret) == 0;
+}
+
+// Start signal monitoring for a VT control process
+int start_signal_monitoring(pid_t target_pid, int tty_number) {
+    if (tty_number < 1 || tty_number >= 64) return -1;
+
+    signal_monitor_t *monitor = &signal_monitors[tty_number];
+
+    // Stop any existing monitoring for this TTY
+    if (monitor->active) {
+        stop_signal_monitoring(tty_number);
+    }
+
+    // Check if strace is available
+    if (!is_strace_available()) {
+        printf("  Warning: strace not available, signal monitoring disabled\n");
+        return -1;
+    }
+
+    // Fork to run strace
+    pid_t strace_pid = fork();
+    if (strace_pid == -1) {
+        perror("Failed to fork for strace");
+        return -1;
+    }
+
+    if (strace_pid == 0) {
+        // Child process: run strace
+        char pid_str[32];
+        snprintf(pid_str, sizeof(pid_str), "%d", target_pid);
+
+        printf("  Starting signal monitoring for PID %d (TTY %d)...\n", target_pid, tty_number);
+        fflush(stdout);
+
+        // Redirect stderr to stdout for easier parsing
+        dup2(STDOUT_FILENO, STDERR_FILENO);
+
+        // Execute strace to monitor signals
+        execl("/usr/bin/strace", "strace",
+              "-p", pid_str,           // Attach to process
+              "-e", "signal",          // Only trace signals
+              "-q",                    // Quiet mode
+              "-o", "/dev/stdout",     // Output to stdout
+              NULL);
+
+        // If execl fails
+        perror("Failed to exec strace");
+        exit(1);
+    }
+
+    // Parent process: record monitoring info
+    monitor->target_pid = target_pid;
+    monitor->strace_pid = strace_pid;
+    monitor->tty_number = tty_number;
+    monitor->active = 1;
+    monitor->start_time = time(NULL);
+
+    printf("  Signal monitoring started for TTY %d VT control process (PID %d)\n",
+           tty_number, target_pid);
+    printf("  Monitor PID: %d\n", strace_pid);
+
+    return 0;
+}
+
+// Stop signal monitoring for a TTY
+void stop_signal_monitoring(int tty_number) {
+    if (tty_number < 1 || tty_number >= 64) return;
+
+    signal_monitor_t *monitor = &signal_monitors[tty_number];
+
+    if (!monitor->active) return;
+
+    printf("  Stopping signal monitoring for TTY %d (PID %d)\n",
+           tty_number, monitor->target_pid);
+
+    // Kill the strace process
+    if (monitor->strace_pid > 0) {
+        kill(monitor->strace_pid, SIGTERM);
+
+        // Wait briefly for graceful termination
+        int status;
+        pid_t result = waitpid(monitor->strace_pid, &status, WNOHANG);
+        if (result == 0) {
+            // Still running, force kill
+            usleep(100000); // 100ms
+            kill(monitor->strace_pid, SIGKILL);
+            waitpid(monitor->strace_pid, &status, 0);
+        }
+    }
+
+    // Clear monitor info
+    memset(monitor, 0, sizeof(signal_monitor_t));
+}
+
+// Cleanup all signal monitors
+void cleanup_all_signal_monitors(void) {
+    printf("Cleaning up all signal monitors...\n");
+    for (int i = 1; i < 64; i++) {
+        if (signal_monitors[i].active) {
+            stop_signal_monitoring(i);
+        }
+    }
+}
 
 // Get process information
 void get_process_info(pid_t pid, char *command, char *username, uid_t *uid) {
@@ -395,8 +519,19 @@ void print_tty_info(const tty_info_t *info) {
         printf("VT Control Process: ");
         if (info->vt_control_pid != -1) {
             printf("PID %d (%s) User: %s\n", info->vt_control_pid, info->control_command, info->control_user);
+
+            // Start signal monitoring for VT control process
+            if (!signal_monitors[info->tty_number].active ||
+                signal_monitors[info->tty_number].target_pid != info->vt_control_pid) {
+                start_signal_monitoring(info->vt_control_pid, info->tty_number);
+            }
         } else {
             printf("None found\n");
+        }
+    } else {
+        // Stop signal monitoring if TTY is no longer in VT_PROCESS mode
+        if (signal_monitors[info->tty_number].active) {
+            stop_signal_monitoring(info->tty_number);
         }
     }
 
@@ -418,7 +553,13 @@ int compare_tty_info(const tty_info_t *old_info, const tty_info_t *new_info) {
 // Monitor all TTYs
 void monitor_all_ttys(void) {
     printf("Monitoring all TTYs for VT_PROCESS mode...\n");
-    printf("Checking every %d ms. Press Ctrl+C to stop.\n\n", MONITOR_INTERVAL_MS);
+    printf("Checking every %d ms. Press Ctrl+C to stop.\n", MONITOR_INTERVAL_MS);
+
+    if (is_strace_available()) {
+        printf("Signal monitoring enabled (using strace)\n\n");
+    } else {
+        printf("Signal monitoring disabled (strace not available)\n\n");
+    }
 
     tty_info_t previous_infos[64] = {0}; // TTY 1-63
     int has_previous[64] = {0};
@@ -457,6 +598,10 @@ void monitor_all_ttys(void) {
                 if (has_previous[tty] && previous_infos[tty].vt_mode == VT_PROCESS) {
                     // TTY changed from VT_PROCESS to VT_AUTO
                     printf("[%ld] TTY %d changed from VT_PROCESS to VT_AUTO mode\n", time(NULL), tty);
+                    // Stop signal monitoring for this TTY
+                    if (signal_monitors[tty].active) {
+                        stop_signal_monitoring(tty);
+                    }
                 }
 
                 // Always update the current state for proper change detection
@@ -467,6 +612,10 @@ void monitor_all_ttys(void) {
                     // TTY info unavailable, but we had it before
                     printf("[%ld] TTY %d no longer accessible\n", time(NULL), tty);
                     has_previous[tty] = 0;
+                    // Stop signal monitoring for this TTY
+                    if (signal_monitors[tty].active) {
+                        stop_signal_monitoring(tty);
+                    }
                 }
             }
         }
@@ -482,12 +631,21 @@ void monitor_all_ttys(void) {
 
         usleep(MONITOR_INTERVAL_MS * 1000);
     }
+
+    // Cleanup signal monitors when exiting
+    cleanup_all_signal_monitors();
 }
 
 // Monitor specific TTY
 void monitor_specific_tty(int tty_number) {
     printf("Monitoring TTY %d...\n", tty_number);
-    printf("Checking every %d ms. Press Ctrl+C to stop.\n\n", MONITOR_INTERVAL_MS);
+    printf("Checking every %d ms. Press Ctrl+C to stop.\n", MONITOR_INTERVAL_MS);
+
+    if (is_strace_available()) {
+        printf("Signal monitoring enabled (using strace)\n\n");
+    } else {
+        printf("Signal monitoring disabled (strace not available)\n\n");
+    }
 
     tty_info_t previous_info = {0};
     int has_previous = 0;
@@ -509,6 +667,11 @@ void monitor_specific_tty(int tty_number) {
         }
 
         usleep(MONITOR_INTERVAL_MS * 1000);
+    }
+
+    // Cleanup signal monitor when exiting
+    if (signal_monitors[tty_number].active) {
+        stop_signal_monitoring(tty_number);
     }
 }
 
@@ -602,6 +765,9 @@ void handle_vt_signals(void) {
 void signal_handler(int sig) {
     printf("\nReceived signal %d, shutting down...\n", sig);
     running = 0;
+
+    // Cleanup signal monitors when shutting down
+    cleanup_all_signal_monitors();
 }
 
 // Setup control mode
@@ -721,9 +887,11 @@ void print_usage(const char *program_name) {
     printf("Modes:\n");
     printf("  1. Monitor all TTYs (default):      %s\n", program_name);
     printf("     Scans all TTYs, shows those in VT_PROCESS mode\n");
+    printf("     Monitors VT control process signals using strace\n");
     printf("\n");
     printf("  2. Monitor specific TTY:            %s /dev/ttyN\n", program_name);
     printf("     Monitors specific TTY for control process and signal changes\n");
+    printf("     Monitors VT control process signals using strace\n");
     printf("\n");
     printf("  3. Control mode:                    %s -c [/dev/ttyN]\n", program_name);
     printf("     Become VT control process for TTY (default: active TTY)\n");
@@ -733,17 +901,22 @@ void print_usage(const char *program_name) {
     printf("  -y              Auto-allow mode (with -c): automatically allow VT switches\n");
     printf("  -h, --help      Show this help\n");
     printf("\n");
+    printf("Signal Monitoring:\n");
+    printf("  In monitoring modes, when a VT control process is detected,\n");
+    printf("  strace is automatically started to monitor signals received\n");
+    printf("  by the control process. This helps track VT switching activity.\n");
+    printf("\n");
     printf("Examples:\n");
-    printf("  %s                    # Monitor all TTYs\n", program_name);
-    printf("  %s /dev/tty2          # Monitor TTY 2\n", program_name);
+    printf("  %s                    # Monitor all TTYs with signal monitoring\n", program_name);
+    printf("  %s /dev/tty2          # Monitor TTY 2 with signal monitoring\n", program_name);
     printf("  %s -c                # Control active TTY with prompts\n", program_name);
     printf("  %s -c /dev/tty1       # Control TTY 1 with prompts\n", program_name);
     printf("  %s -c -y /dev/tty3    # Control TTY 3, auto-allow switches\n", program_name);
 }
 
 int main(int argc, char *argv[]) {
-    printf("TTY Debug Tool - Simplified Version\n");
-    printf("===================================\n\n");
+    printf("TTY Debug Tool - Simplified Version with Signal Monitoring\n");
+    printf("==========================================================\n\n");
 
     program_mode_t mode = MODE_MONITOR_ALL;
     int control_mode = 0;
