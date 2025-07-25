@@ -69,9 +69,11 @@ typedef struct {
     int tty_number;
     int auto_allow;        // -y flag: automatically allow switches
     int set_auto_mode;     // --auto flag: set VT mode to VT_AUTO
+    int set_text_mode;     // --text flag: set KD mode to KD_TEXT
     int control_fd;
     int signal_fd;         // signalfd for safe signal handling
     struct vt_mode original_mode;
+    int original_kd_mode;  // Store original KD mode for restoration
 } control_config_t;
 
 static control_config_t control_config = {0};
@@ -91,7 +93,7 @@ void print_tty_info(const tty_info_t *info);
 int compare_tty_info(const tty_info_t *old_info, const tty_info_t *new_info);
 void monitor_all_ttys(void);
 void monitor_specific_tty(int tty_number);
-int setup_control_mode(int tty_number, int auto_allow, int set_auto_mode);
+int setup_control_mode(int tty_number, int auto_allow, int set_auto_mode, int set_text_mode);
 void cleanup_control_mode(void);
 void handle_vt_signals(void);
 int ask_user_permission(void);
@@ -1064,7 +1066,7 @@ void signal_handler(int sig) {
 }
 
 // Setup control mode
-int setup_control_mode(int tty_number, int auto_allow, int set_auto_mode) {
+int setup_control_mode(int tty_number, int auto_allow, int set_auto_mode, int set_text_mode) {
     char tty_path[MAX_PATH_LEN];
     snprintf(tty_path, sizeof(tty_path), "/dev/tty%d", tty_number);
 
@@ -1087,6 +1089,30 @@ int setup_control_mode(int tty_number, int auto_allow, int set_auto_mode) {
         fprintf(stderr, "Failed to get current VT mode: %s\n", strerror(errno));
         close(control_config.control_fd);
         return -1;
+    }
+
+    // Get current KD mode for restoration later
+    if (ioctl(control_config.control_fd, KDGETMODE, &control_config.original_kd_mode) == -1) {
+        fprintf(stderr, "Failed to get current KD mode: %s\n", strerror(errno));
+        close(control_config.control_fd);
+        return -1;
+    }
+
+    // Set KD mode based on --text parameter
+    if (set_text_mode) {
+        printf("Setting KD_TEXT mode for TTY %d\n", tty_number);
+        if (ioctl(control_config.control_fd, KDSETMODE, KD_TEXT) == -1) {
+            fprintf(stderr, "Failed to set KD_TEXT mode: %s\n", strerror(errno));
+            close(control_config.control_fd);
+            return -1;
+        }
+    } else {
+        printf("Setting KD_GRAPHICS mode for TTY %d\n", tty_number);
+        if (ioctl(control_config.control_fd, KDSETMODE, KD_GRAPHICS) == -1) {
+            fprintf(stderr, "Failed to set KD_GRAPHICS mode: %s\n", strerror(errno));
+            close(control_config.control_fd);
+            return -1;
+        }
     }
 
     // Setup signalfd for safe signal handling
@@ -1145,7 +1171,8 @@ int setup_control_mode(int tty_number, int auto_allow, int set_auto_mode) {
 
     control_config.tty_number = tty_number;
     control_config.auto_allow = auto_allow;
-    control_config.set_auto_mode = set_auto_mode; // Store the new parameter
+    control_config.set_auto_mode = set_auto_mode;
+    control_config.set_text_mode = set_text_mode;
 
     printf("VT control mode enabled successfully!\n");
     printf("This process (PID %d) is now the VT control process for TTY %d\n",
@@ -1175,6 +1202,15 @@ void cleanup_control_mode(void) {
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
     sigprocmask(SIG_UNBLOCK, &mask, NULL);
+
+    // Restore original KD mode (always restore since we always set it)
+    if (ioctl(control_config.control_fd, KDSETMODE, control_config.original_kd_mode) == -1) {
+        fprintf(stderr, "Warning: Failed to restore original KD mode: %s\n", strerror(errno));
+    } else {
+        const char *original_kd_str = (control_config.original_kd_mode == KD_TEXT) ? "KD_TEXT" :
+                                     (control_config.original_kd_mode == KD_GRAPHICS) ? "KD_GRAPHICS" : "UNKNOWN";
+        printf("Original KD mode (%s) restored\n", original_kd_str);
+    }
 
     // Restore original VT mode
     if (ioctl(control_config.control_fd, VT_SETMODE, &control_config.original_mode) == -1) {
@@ -1210,6 +1246,7 @@ void print_usage(const char *program_name) {
     printf("  -c              Enable control mode\n");
     printf("  -y              Auto-allow mode (with -c): automatically allow VT switches\n");
     printf("  --auto          Set VT mode to VT_AUTO (with -c): disable VT control\n");
+    printf("  --text          Set KD mode to KD_TEXT (with -c): default is KD_GRAPHICS\n");
     printf("  -h, --help      Show this help\n");
     printf("\n");
     printf("Signal Monitoring:\n");
@@ -1225,10 +1262,12 @@ void print_usage(const char *program_name) {
     printf("Examples:\n");
     printf("  %s                    # Monitor all TTYs + active TTY with signal monitoring\n", program_name);
     printf("  %s /dev/tty2          # Monitor TTY 2 with signal monitoring\n", program_name);
-    printf("  %s -c                # Control active TTY with prompts\n", program_name);
-    printf("  %s -c /dev/tty1       # Control TTY 1 with prompts\n", program_name);
-    printf("  %s -c -y /dev/tty3    # Control TTY 3, auto-allow switches\n", program_name);
-    printf("  %s -c --auto /dev/tty4 # Set TTY 4 to VT_AUTO mode\n", program_name);
+    printf("  %s -c                # Control active TTY with prompts (KD_GRAPHICS)\n", program_name);
+    printf("  %s -c /dev/tty1       # Control TTY 1 with prompts (KD_GRAPHICS)\n", program_name);
+    printf("  %s -c -y /dev/tty3    # Control TTY 3, auto-allow switches (KD_GRAPHICS)\n", program_name);
+    printf("  %s -c --auto /dev/tty4 # Set TTY 4 to VT_AUTO mode (KD_GRAPHICS)\n", program_name);
+    printf("  %s -c --text /dev/tty5 # Control TTY 5 in KD_TEXT mode\n", program_name);
+    printf("  %s -c --auto --text /dev/tty6 # Set TTY 6 to VT_AUTO + KD_TEXT mode\n", program_name);
 }
 
 int main(int argc, char *argv[]) {
@@ -1239,6 +1278,7 @@ int main(int argc, char *argv[]) {
     int control_mode = 0;
     int auto_allow = 0;
     int set_auto_mode = 0;
+    int set_text_mode = 0;
     int target_tty = -1;
 
     // Initialize control config
@@ -1256,6 +1296,8 @@ int main(int argc, char *argv[]) {
             auto_allow = 1;
         } else if (strcmp(argv[i], "--auto") == 0) {
             set_auto_mode = 1;
+        } else if (strcmp(argv[i], "--text") == 0) {
+            set_text_mode = 1;
         } else if (strncmp(argv[i], "/dev/tty", 8) == 0) {
             target_tty = parse_tty_device(argv[i]);
             if (target_tty == -1) {
@@ -1277,6 +1319,11 @@ int main(int argc, char *argv[]) {
 
     if (set_auto_mode && !control_mode) {
         fprintf(stderr, "Error: --auto option can only be used with -c\n");
+        return 1;
+    }
+
+    if (set_text_mode && !control_mode) {
+        fprintf(stderr, "Error: --text option can only be used with -c\n");
         return 1;
     }
 
@@ -1309,7 +1356,7 @@ int main(int argc, char *argv[]) {
             break;
 
         case MODE_CONTROL:
-            if (setup_control_mode(target_tty, auto_allow, set_auto_mode) == 0) {
+            if (setup_control_mode(target_tty, auto_allow, set_auto_mode, set_text_mode) == 0) {
                 if (set_auto_mode) {
                     // VT_AUTO mode - just wait for user to stop
                     printf("VT_AUTO mode set. Press Ctrl+C to restore original mode and exit.\n");
