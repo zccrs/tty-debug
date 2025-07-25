@@ -767,7 +767,7 @@ void print_tty_info(const tty_info_t *info) {
 
 // Monitor all TTYs
 void monitor_all_ttys(void) {
-    printf("Monitoring all TTYs for VT_PROCESS mode...\n");
+    printf("Monitoring all TTYs and active TTY...\n");
     printf("Checking every %d ms. Press Ctrl+C to stop.\n", MONITOR_INTERVAL_MS);
 
     if (is_strace_available()) {
@@ -785,6 +785,7 @@ void monitor_all_ttys(void) {
 
     while (running) {
         int found_vt_process = 0;
+        int found_monitored_tty = 0;
 
         // Check and report active TTY changes
         int current_active_tty = get_active_tty_from_sysfs();
@@ -805,32 +806,52 @@ void monitor_all_ttys(void) {
             tty_info_t current_info;
             collect_tty_info(tty, &current_info);
 
-            if (current_info.vt_mode == VT_PROCESS) {
-                found_vt_process = 1;
+            // Always monitor the active TTY, regardless of VT mode
+            int is_active_tty = (tty == current_active_tty);
+            int should_monitor = (current_info.vt_mode == VT_PROCESS) || is_active_tty;
 
-                // Check if this is a new VT_PROCESS TTY or if details changed
+            if (should_monitor) {
+                if (current_info.vt_mode == VT_PROCESS) {
+                    found_vt_process = 1;
+                }
+                found_monitored_tty = 1;
+
+                // Check if this is a new monitored TTY or if details changed
                 if (!has_previous[tty]) {
-                    // New VT_PROCESS TTY detected
-                    printf("[%ld] TTY %d entered VT_PROCESS mode:\n", (long)time(NULL), tty);
+                    // New monitored TTY detected
+                    if (is_active_tty && current_info.vt_mode != VT_PROCESS) {
+                        printf("[%ld] TTY %d (ACTIVE) state:\n", (long)time(NULL), tty);
+                    } else {
+                        printf("[%ld] TTY %d entered VT_PROCESS mode:\n", (long)time(NULL), tty);
+                    }
                     print_tty_info(&current_info);
                     previous_infos[tty] = current_info;
                     has_previous[tty] = 1;
-                } else if (previous_infos[tty].vt_mode != VT_PROCESS) {
-                    // TTY changed from VT_AUTO to VT_PROCESS
-                    printf("[%ld] TTY %d changed from VT_AUTO to VT_PROCESS mode:\n", (long)time(NULL), tty);
+                } else if (previous_infos[tty].vt_mode != current_info.vt_mode) {
+                    // TTY mode changed
+                    const char *old_mode = (previous_infos[tty].vt_mode == VT_AUTO) ? "VT_AUTO" :
+                                          (previous_infos[tty].vt_mode == VT_PROCESS) ? "VT_PROCESS" : "UNKNOWN";
+                    const char *new_mode = (current_info.vt_mode == VT_AUTO) ? "VT_AUTO" :
+                                          (current_info.vt_mode == VT_PROCESS) ? "VT_PROCESS" : "UNKNOWN";
+                    printf("[%ld] TTY %d%s changed from %s to %s mode:\n",
+                           (long)time(NULL), tty, is_active_tty ? " (ACTIVE)" : "",
+                           old_mode, new_mode);
                     print_tty_info(&current_info);
                     previous_infos[tty] = current_info;
                 } else if (compare_tty_info(&previous_infos[tty], &current_info)) {
-                    // VT_PROCESS TTY details changed
-                    printf("[%ld] TTY %d VT_PROCESS details changed:\n", (long)time(NULL), tty);
+                    // TTY details changed
+                    printf("[%ld] TTY %d%s details changed:\n",
+                           (long)time(NULL), tty, is_active_tty ? " (ACTIVE)" : "");
                     print_tty_info(&current_info);
                     previous_infos[tty] = current_info;
                 }
             } else {
-                // TTY is not in VT_PROCESS mode
-                if (has_previous[tty] && previous_infos[tty].vt_mode == VT_PROCESS) {
-                    // TTY changed from VT_PROCESS to VT_AUTO
-                    printf("[%ld] TTY %d changed from VT_PROCESS to VT_AUTO mode\n", (long)time(NULL), tty);
+                // TTY should not be monitored
+                if (has_previous[tty]) {
+                    // Previously monitored TTY is no longer being monitored
+                    if (previous_infos[tty].vt_mode == VT_PROCESS) {
+                        printf("[%ld] TTY %d changed from VT_PROCESS to VT_AUTO mode\n", (long)time(NULL), tty);
+                    }
                     // Stop signal monitoring for this TTY
                     stop_all_signal_monitoring_for_tty(tty);
                 }
@@ -849,11 +870,18 @@ void monitor_all_ttys(void) {
             }
         }
 
-        if (!found_vt_process) {
+        if (!found_monitored_tty) {
+            static time_t last_no_monitored_msg = 0;
+            time_t now = time(NULL);
+            if (now - last_no_monitored_msg >= 5) { // Print every 5 seconds
+                printf("[%ld] No TTYs being monitored (Active: TTY %d)\n", (long)now, current_active_tty);
+                last_no_monitored_msg = now;
+            }
+        } else if (!found_vt_process) {
             static time_t last_no_vt_process_msg = 0;
             time_t now = time(NULL);
-            if (now - last_no_vt_process_msg >= 5) { // Print every 5 seconds
-                printf("[%ld] No TTYs found in VT_PROCESS mode (Active: TTY %d)\n", (long)now, current_active_tty);
+            if (now - last_no_vt_process_msg >= 10) { // Print every 10 seconds
+                printf("[%ld] No TTYs in VT_PROCESS mode, monitoring active TTY %d\n", (long)now, current_active_tty);
                 last_no_vt_process_msg = now;
             }
         }
@@ -1151,6 +1179,7 @@ void print_usage(const char *program_name) {
     printf("Modes:\n");
     printf("  1. Monitor all TTYs (default):      %s\n", program_name);
     printf("     Scans all TTYs, shows those in VT_PROCESS mode\n");
+    printf("     Always monitors the active TTY regardless of mode\n");
     printf("     Monitors VT control process signals using strace\n");
     printf("\n");
     printf("  2. Monitor specific TTY:            %s /dev/ttyN\n", program_name);
@@ -1170,8 +1199,13 @@ void print_usage(const char *program_name) {
     printf("  strace is automatically started to monitor signals received\n");
     printf("  by the control process. This helps track VT switching activity.\n");
     printf("\n");
+    printf("Active TTY Monitoring:\n");
+    printf("  In monitor all mode, the currently active TTY is always monitored\n");
+    printf("  even if it's not in VT_PROCESS mode. This helps track system\n");
+    printf("  activity and TTY state changes in real-time.\n");
+    printf("\n");
     printf("Examples:\n");
-    printf("  %s                    # Monitor all TTYs with signal monitoring\n", program_name);
+    printf("  %s                    # Monitor all TTYs + active TTY with signal monitoring\n", program_name);
     printf("  %s /dev/tty2          # Monitor TTY 2 with signal monitoring\n", program_name);
     printf("  %s -c                # Control active TTY with prompts\n", program_name);
     printf("  %s -c /dev/tty1       # Control TTY 1 with prompts\n", program_name);
