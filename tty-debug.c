@@ -68,6 +68,7 @@ typedef struct {
 typedef struct {
     int tty_number;
     int auto_allow;        // -y flag: automatically allow switches
+    int set_auto_mode;     // --auto flag: set VT mode to VT_AUTO
     int control_fd;
     int signal_fd;         // signalfd for safe signal handling
     struct vt_mode original_mode;
@@ -90,7 +91,7 @@ void print_tty_info(const tty_info_t *info);
 int compare_tty_info(const tty_info_t *old_info, const tty_info_t *new_info);
 void monitor_all_ttys(void);
 void monitor_specific_tty(int tty_number);
-int setup_control_mode(int tty_number, int auto_allow);
+int setup_control_mode(int tty_number, int auto_allow, int set_auto_mode);
 void cleanup_control_mode(void);
 void handle_vt_signals(void);
 int ask_user_permission(void);
@@ -1063,7 +1064,7 @@ void signal_handler(int sig) {
 }
 
 // Setup control mode
-int setup_control_mode(int tty_number, int auto_allow) {
+int setup_control_mode(int tty_number, int auto_allow, int set_auto_mode) {
     char tty_path[MAX_PATH_LEN];
     snprintf(tty_path, sizeof(tty_path), "/dev/tty%d", tty_number);
 
@@ -1111,17 +1112,32 @@ int setup_control_mode(int tty_number, int auto_allow) {
         return -1;
     }
 
-    // Set VT_PROCESS mode
-    struct vt_mode new_mode = {
-        .mode = VT_PROCESS,
-        .waitv = 0,
-        .relsig = SIGUSR1,
-        .acqsig = SIGUSR2,
-        .frsig = 0
-    };
+    // Set VT mode based on set_auto_mode parameter
+    struct vt_mode new_mode;
+    if (set_auto_mode) {
+        // Set VT_AUTO mode
+        new_mode = (struct vt_mode){
+            .mode = VT_AUTO,
+            .waitv = 0,
+            .relsig = 0,
+            .acqsig = 0,
+            .frsig = 0
+        };
+        printf("Setting VT_AUTO mode for TTY %d\n", tty_number);
+    } else {
+        // Set VT_PROCESS mode (default behavior)
+        new_mode = (struct vt_mode){
+            .mode = VT_PROCESS,
+            .waitv = 0,
+            .relsig = SIGUSR1,
+            .acqsig = SIGUSR2,
+            .frsig = 0
+        };
+        printf("Setting VT_PROCESS mode for TTY %d\n", tty_number);
+    }
 
     if (ioctl(control_config.control_fd, VT_SETMODE, &new_mode) == -1) {
-        fprintf(stderr, "Failed to set VT_PROCESS mode: %s\n", strerror(errno));
+        fprintf(stderr, "Failed to set VT mode: %s\n", strerror(errno));
         close(control_config.signal_fd);
         close(control_config.control_fd);
         return -1;
@@ -1129,6 +1145,7 @@ int setup_control_mode(int tty_number, int auto_allow) {
 
     control_config.tty_number = tty_number;
     control_config.auto_allow = auto_allow;
+    control_config.set_auto_mode = set_auto_mode; // Store the new parameter
 
     printf("VT control mode enabled successfully!\n");
     printf("This process (PID %d) is now the VT control process for TTY %d\n",
@@ -1192,6 +1209,7 @@ void print_usage(const char *program_name) {
     printf("Options:\n");
     printf("  -c              Enable control mode\n");
     printf("  -y              Auto-allow mode (with -c): automatically allow VT switches\n");
+    printf("  --auto          Set VT mode to VT_AUTO (with -c): disable VT control\n");
     printf("  -h, --help      Show this help\n");
     printf("\n");
     printf("Signal Monitoring:\n");
@@ -1210,6 +1228,7 @@ void print_usage(const char *program_name) {
     printf("  %s -c                # Control active TTY with prompts\n", program_name);
     printf("  %s -c /dev/tty1       # Control TTY 1 with prompts\n", program_name);
     printf("  %s -c -y /dev/tty3    # Control TTY 3, auto-allow switches\n", program_name);
+    printf("  %s -c --auto /dev/tty4 # Set TTY 4 to VT_AUTO mode\n", program_name);
 }
 
 int main(int argc, char *argv[]) {
@@ -1219,6 +1238,7 @@ int main(int argc, char *argv[]) {
     program_mode_t mode = MODE_MONITOR_ALL;
     int control_mode = 0;
     int auto_allow = 0;
+    int set_auto_mode = 0;
     int target_tty = -1;
 
     // Initialize control config
@@ -1234,6 +1254,8 @@ int main(int argc, char *argv[]) {
             control_mode = 1;
         } else if (strcmp(argv[i], "-y") == 0) {
             auto_allow = 1;
+        } else if (strcmp(argv[i], "--auto") == 0) {
+            set_auto_mode = 1;
         } else if (strncmp(argv[i], "/dev/tty", 8) == 0) {
             target_tty = parse_tty_device(argv[i]);
             if (target_tty == -1) {
@@ -1250,6 +1272,11 @@ int main(int argc, char *argv[]) {
     // Validate arguments
     if (auto_allow && !control_mode) {
         fprintf(stderr, "Error: -y option can only be used with -c\n");
+        return 1;
+    }
+
+    if (set_auto_mode && !control_mode) {
+        fprintf(stderr, "Error: --auto option can only be used with -c\n");
         return 1;
     }
 
@@ -1282,9 +1309,17 @@ int main(int argc, char *argv[]) {
             break;
 
         case MODE_CONTROL:
-            if (setup_control_mode(target_tty, auto_allow) == 0) {
-                // Handle VT signals using signalfd
-                handle_vt_signals();
+            if (setup_control_mode(target_tty, auto_allow, set_auto_mode) == 0) {
+                if (set_auto_mode) {
+                    // VT_AUTO mode - just wait for user to stop
+                    printf("VT_AUTO mode set. Press Ctrl+C to restore original mode and exit.\n");
+                    while (running) {
+                        sleep(1);
+                    }
+                } else {
+                    // VT_PROCESS mode - handle VT signals using signalfd
+                    handle_vt_signals();
+                }
                 cleanup_control_mode();
             }
             break;
